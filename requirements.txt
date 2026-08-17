@@ -1,0 +1,8 @@
+--index-url https://download.pytorch.org/whl/cu130
+numpy
+gymnasium
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0
+torch==2.13.0+cu130
+onnx
+optuna
