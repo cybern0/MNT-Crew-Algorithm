@@ -143,20 +143,43 @@ def export_model(name: str, n_actions: int | None = None) -> None:
     onnx_path = os.path.join(ONNX_OUT_DIR, f"{name}.onnx")
     os.makedirs(ONNX_OUT_DIR, exist_ok=True)
 
-    model = PPO.load(load_path)
+    # Charge sur CPU : torch.onnx.export ne supporte pas CUDA (l'export trace
+    # le graphe en mode eager, et un mismatch device CUDA/CPU entre les poids
+    # et les inputs factices leve "Expected all tensors to be on the same device".
+    # En forçant device="cpu", on garantit que tout le graphe est CPU-only.
+    model = PPO.load(load_path, device="cpu")
     policy = model.policy
     policy.eval()
+    # Ceinture + bretelles : force le deplacement de tous les sous-modules
+    # (features_extractor, mlp_extractor, action_net, LSTM si RecurrentPPO).
+    policy.to("cpu")
 
     if n_actions is not None:
         _verify_action_count(policy, n_actions, name)
 
-    wrapper = ONNXPolicyWrapper(policy)
+    wrapper = ONNXPolicyWrapper(policy).to("cpu")
+    wrapper.eval()
+
+    # Verification defensive : si un seul parametre est encore sur CUDA,
+    # on le signale explicitement (au cas ou .to("cpu") n'aurait pas tout
+    # attrape, notamment pour les buffers LSTM non-standards).
+    cuda_params = [
+        n for n, p in wrapper.named_parameters() if p.is_cuda
+    ] + [
+        n for n, b in wrapper.named_buffers() if b.is_cuda
+    ]
+    if cuda_params:
+        raise RuntimeError(
+            f"[export] {name} : {len(cuda_params)} tenseurs encore sur CUDA apres .to('cpu') "
+            f"(ex : {cuda_params[:3]}). Rechargez avec device='cpu' ou desactivez CUDA "
+            f"avant l'export (CUDA_VISIBLE_DEVICES='')."
+        )
 
     # 15 canaux (Twist) : 11 one-hot tuiles + abs elevation + rel elevation
     #                     + next_X (look-ahead excavateur) + next_G (look-ahead grappler).
-    map_ = torch.zeros(1, 15, 30, 30)
+    map_ = torch.zeros(1, 15, 30, 30, device="cpu")
     # 6 scalaires : stamina, batterie, temps, X, Y, isOnEngine.
-    stats = torch.zeros(1, 6)
+    stats = torch.zeros(1, 6, device="cpu")
 
     torch.onnx.export(
         wrapper, (map_, stats), onnx_path,
