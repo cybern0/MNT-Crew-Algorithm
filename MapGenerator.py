@@ -94,43 +94,96 @@ def _enforce_twist_constraints(rows: list[str], elevation: np.ndarray) -> None:
       - 'o' / 't' : |elev - voisin| <= 5 (règle du Twist)
       - '#' : elev 0 ; autres : elev dans [1, 9]
 
-    Modifie `elevation` en place. Aucune garantie d'optimalité ; on clippe
-    vers le voisin le plus proche de la contrainte.
+    Modifie `elevation` en place. L'algorithme :
+
+      1. On clip d'abord 0 pour '#', [1,9] pour le reste.
+      2. Pour chaque 'o'/'t', on tire son élévation vers le voisin (mid-point).
+         On boucle jusqu'à convergence ou jusqu'à max_passes (50) — c'est
+         largement suffisant pour une grille 15x20.
+      3. Si après convergence un 'o'/'t' reste en violation (cas où son
+         voisin est lui-même un 'o'/'t' contraint par un autre voisin très
+         haut), on tente de pousser le VOISIN non-'o'/'t' d'un cran vers
+         la valeur du 'o'/'t' (cela peut casser légèrement la pente
+         générale mais évite une carte injouable).
+
+    L'approche converge parce que les 'o'/'t' sont peu nombreux et que les
+    déplacements d'élévation sont bornés ([1,9]).
     """
     h, w = elevation.shape
-    # D'abord, reserrer les rochers à 0 et les autres à >= 1.
+    # 1. Clipping initial : '#' -> 0, autres -> [1, 9].
     for y in range(h):
         for x in range(w):
             if rows[y][x] == ROCK:
                 elevation[y, x] = 0
             else:
-                if elevation[y, x] < 1:
+                v = int(elevation[y, x])
+                if v < 1:
                     elevation[y, x] = 1
-                elif elevation[y, x] > 9:
+                elif v > 9:
                     elevation[y, x] = 9
 
-    # Ensuite, appliquer la contrainte o/t <= 5 vs. voisin > 0.
-    for _ in range(3):  # converger en quelques passes
+    # 2. Tirer chaque 'o'/'t' vers le midpoint avec le voisin le plus extrême.
+    # On boucle jusqu'à ce qu'aucun 'o'/'t' ne change pendant une passe complète.
+    MAX_PASSES = 50
+    for _ in range(MAX_PASSES):
         changed = False
         for y in range(h):
             for x in range(w):
                 tile = rows[y][x]
                 if tile not in {"o", "t"}:
                     continue
+                cur = int(elevation[y, x])
+                # Trouver le voisin > 0 le plus éloigné en valeur absolue.
+                worst_diff = 0
+                worst_neighbor = cur
                 for nx, ny in _neighbors(x, y, w, h):
                     neighbor = int(elevation[ny, nx])
                     if neighbor <= 0:
                         continue
-                    cur = int(elevation[y, x])
-                    if abs(cur - neighbor) > 5:
-                        # Tirer vers le voisin sans casser [1, 9].
-                        new_val = neighbor + 5 if cur < neighbor else max(neighbor - 5, 1)
-                        new_val = max(1, min(9, new_val))
-                        if new_val != cur:
-                            elevation[y, x] = new_val
-                            changed = True
+                    diff = abs(cur - neighbor)
+                    if diff > worst_diff:
+                        worst_diff = diff
+                        worst_neighbor = neighbor
+                if worst_diff > 5:
+                    # Tirer vers le voisin sans casser [1, 9].
+                    # On se place à ±5 du voisin extrême, dans le sens qui
+                    # rapproche cur de worst_neighbor.
+                    if cur < worst_neighbor:
+                        new_val = worst_neighbor - 5
+                    else:
+                        new_val = worst_neighbor + 5
+                    new_val = max(1, min(9, new_val))
+                    if new_val != cur:
+                        elevation[y, x] = new_val
+                        changed = True
         if not changed:
             break
+
+    # 3. Filet de sécurité : si un 'o'/'t' reste en violation (cas rare de
+    # contraintes circulaires entre 'o'/'t' voisins), on abaisse le VOISIN
+    # non-'o'/'t' le plus haut pour faire taire la violation. On ne touche
+    # jamais aux rochers (elevation 0) ni aux autres 'o'/'t' (déjà réglés
+    # à l'étape 2).
+    for y in range(h):
+        for x in range(w):
+            tile = rows[y][x]
+            if tile not in {"o", "t"}:
+                continue
+            cur = int(elevation[y, x])
+            for nx, ny in _neighbors(x, y, w, h):
+                neighbor = int(elevation[ny, nx])
+                if neighbor <= 0:
+                    continue
+                if abs(cur - neighbor) > 5:
+                    # Pousser le voisin (non '#' et non 'o'/'t') vers cur.
+                    if rows[ny][nx] in {"o", "t", ROCK}:
+                        continue
+                    if cur < neighbor:
+                        new_neighbor = cur + 5
+                    else:
+                        new_neighbor = cur - 5
+                    new_neighbor = max(1, min(9, new_neighbor))
+                    elevation[ny, nx] = new_neighbor
 
 
 def _place_unique(rows: list[str], tile: str, rnd: random.Random,
