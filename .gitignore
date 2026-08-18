@@ -1,6 +1,8 @@
 # Ignore ONNX models (existing rule)
 *.onnx
-
+*.py.txt
+map.txt
+elevation.txt
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
