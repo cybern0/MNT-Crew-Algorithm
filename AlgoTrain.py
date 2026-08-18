@@ -31,6 +31,14 @@ Observation conforme au preprocesseur C# cible (Twist + look-ahead machines) :
     scalars : float32[6]
               stamina, batterie, temps, position X/Y, isOnEngine
 
+REGLE IMPORTANTE (look-ahead conditionnel) :
+    Les canaux 13 (next_X) et 14 (next_G) ne sont remplis QUE si la case
+    devant le hero (hero_pos + facing_direction) contient un coffre '*'.
+    Sinon, ces deux canaux restent a zero. Cela evite de polluer l'observation
+    avec du bruit de simulation quand le hero n'est pas en situation de push.
+    Utiliser la fonction `should_run_lookahead(ascii_map, hero_pos, facing)`
+    pour decider d'appeler ou non le simulateur de machines.
+
 Le script peut etre appele deux fois (une fois par hero) :
 
     python AlgoTrain.py --hero F --map map.txt --elevation elevation.txt --output ModelStates/ikotofosa
@@ -138,6 +146,10 @@ HEROES: dict[str, dict[str, Any]] = {
 DEFAULT_ENGINE_CONFIG = {
     "look_ahead": True,
     "lookahead_ticks": 2,
+    # REGLE (twist conditionnel) : les canaux next_X / next_G ne sont remplis
+    # QUE si un coffre ('*') se trouve devant le hero. Sinon, les 2 canaux
+    # restent a zero. Cela correspond a la regle appliquee cote Godot.
+    "lookahead_only_if_chest_ahead": True,
     "avoid_chest_collisions": True,
     "avoid_agent_collisions": True,
     "avoid_competing_pushers": True,
@@ -380,6 +392,60 @@ def import_module(path: Path, module_name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# ---------------------------------------------------------------------------
+# Look-ahead conditionnel : ne simuler les machines que si un coffre est
+# devant le hero. Cette fonction est aussi l'autorite cote Python : si elle
+# retourne False, les canaux 13 et 14 du tenseur d'observation restent a zero.
+# `facing` est un tuple (dx, dy) : (0,-1)=UP, (0,1)=DOWN, (-1,0)=LEFT,
+# (1,0)=RIGHT. Toute autre valeur (y compris (0,0)) desactive le lookahead.
+# ---------------------------------------------------------------------------
+FACING_VECTORS: dict[str, tuple[int, int]] = {
+    "UP": (0, -1),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
+    "PUSH_UP": (0, -1),
+    "PUSH_DOWN": (0, 1),
+    "PUSH_LEFT": (-1, 0),
+    "PUSH_RIGHT": (1, 0),
+}
+
+
+def should_run_lookahead(
+    ascii_rows: list[str],
+    hero_pos: tuple[int, int],
+    facing: tuple[int, int],
+) -> bool:
+    """Retourne True ssi la case devant le hero contient un coffre '*'.
+
+    Hors-carte ou direction invalide => False (pas de lookahead).
+    Utilisee par l'environnement Python pour decider de remplir les canaux
+    13/14. Mirroir de la regle cote Godot (HasChestAhead()).
+    """
+    if ascii_rows is None or not ascii_rows:
+        return False
+    dx, dy = facing
+    if (dx, dy) == (0, 0):
+        return False
+    hx, hy = hero_pos
+    fx, fy = hx + dx, hy + dy
+    if fy < 0 or fy >= len(ascii_rows):
+        return False
+    row = ascii_rows[fy]
+    if fx < 0 or fx >= len(row):
+        return False
+    return row[fx] == "*"
+
+
+def parse_facing(action: str) -> tuple[int, int]:
+    """Convertit un nom d'action en vecteur direction (dx, dy).
+
+    UP/DOWN/LEFT/RIGHT et PUSH_* sont supportes. Toute autre action
+    (HACK, WAIT, HACK_*) retourne (0, 0) -> lookahead desactive.
+    """
+    return FACING_VECTORS.get(action, (0, 0))
 
 
 def find_factory(module) -> Callable[..., gym.Env]:
