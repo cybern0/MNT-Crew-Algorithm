@@ -70,9 +70,14 @@ class ONNXPolicyWrapper(nn.Module):
 
     Le wrapper ne depend pas du nombre d'actions : il appelle action_net
     qui est dimensionnee automatiquement par SB3 a partir de
-    policy.action_space.n. On renvoie le argmax (action discrete) ; si
-    vous avez besoin des probas brutes pour un sampling temperature, il
-    faut remplacer torch.argmax par logits.
+    policy.action_space.n.
+
+    IMPORTANT : on retourne les LOGITS bruts (shape [batch, n_actions]),
+    pas l'argmax. Le C# (Ikotofosa.ExtractArgmax / Imahaki.ExtractArgmax)
+    applique lui-meme argmax cote runtime, et verifie que la taille de
+    sortie correspond a _actionNames.Length (14 ou 13). Si on renvoyait
+    argmax(logits), la sortie aurait pour shape [batch] = [1] et le check
+    "got 1, expected 14" echouerait.
     """
 
     def __init__(self, policy):
@@ -85,7 +90,10 @@ class ONNXPolicyWrapper(nn.Module):
         features = self.features_extractor({"grid": map_, "scalars": stats})
         latent_pi = self.mlp_extractor.forward_actor(features)
         logits = self.action_net(latent_pi)
-        return torch.argmax(logits, dim=1)
+        # Retourne les logits [batch, n_actions]. Le C# fera l'argmax.
+        # On ajoute aussi dynamic_axes sur l'axe des actions dans torch.onnx.export
+        # pour supporter un eventuel changement de catalogue d'actions.
+        return logits
 
 
 def _resolve_model_path(name: str, model_state_dir: str) -> str:
@@ -184,7 +192,11 @@ def export_model(name: str, n_actions: int | None = None) -> None:
     torch.onnx.export(
         wrapper, (map_, stats), onnx_path,
         input_names=["map", "stats"], output_names=["action"],
-        dynamic_axes={"map": {0: "batch"}, "stats": {0: "batch"}},
+        dynamic_axes={
+            "map": {0: "batch"},
+            "stats": {0: "batch"},
+            "action": {0: "batch"},  # n_actions reste fixe (axe 1)
+        },
         opset_version=17, dynamo=False,
     )
 
