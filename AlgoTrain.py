@@ -21,9 +21,13 @@ On entraine DEUX politiques distinctes (un ONNX par hero) :
           = 13
           (HACK_CUT est automatique sur les grapplers, donc non emis.)
 
-Observation conforme au modele existant et au preprocesseur C# cible :
-    grid    : float32[13, 30, 30]
-              11 canaux one-hot + elevation absolue + elevation relative
+Observation conforme au preprocesseur C# cible (Twist + look-ahead machines) :
+    grid    : float32[15, 30, 30]
+              11 canaux one-hot tuiles
+            + 1 canal elevation absolue (normalise [-1,1])
+            + 1 canal elevation relative (level - mean, clipped [-1,1])
+            + 1 canal "next_X" : positions futures des excavateurs (T+lookahead)
+            + 1 canal "next_G" : positions futures des grapplers   (T+lookahead)
     scalars : float32[6]
               stamina, batterie, temps, position X/Y, isOnEngine
 
@@ -32,7 +36,8 @@ Le script peut etre appele deux fois (une fois par hero) :
     python AlgoTrain.py --hero F --map map.txt --elevation elevation.txt --output ModelStates/ikotofosa
     python AlgoTrain.py --hero M --map map.txt --elevation elevation.txt --output ModelStates/imahaki
 
-Puis Exports.py produira ikotofosa.onnx (14 actions) et imahaki.onnx (13 actions).
+Puis Exports.py produira ikotofosa.onnx (14 actions) et imahaki.onnx (13 actions),
+chacun attend un tenseur d'entree map de forme [1, 15, 30, 30].
 
 L'environnement concret doit etre expose par AlgoEnv.py sous l'une des formes :
     - make_env(... hero="F"|"M" ...)
@@ -71,8 +76,13 @@ MAX_HEIGHT = 30
 MAX_WIDTH = 30
 MAX_SOURCE_HEIGHT = 15
 MAX_SOURCE_WIDTH = 20
-N_GRID_CHANNELS = 13
+
+# Twist : 15 canaux d'observation = 11 one-hot tuiles + 1 abs elevation + 1 rel
+# elevation + 1 next_X (look-ahead excavateur) + 1 next_G (look-ahead grappler).
+N_GRID_CHANNELS = 15
+N_TILE_CHANNELS = 11
 N_SCALARS = 6
+LOOKAHEAD_TICKS = 2  # doir matcher TwistConfig.LookaheadTicks côté C#
 
 ASCII_TILES = frozenset(".#to*+@FMXG")
 AUGMENTATIONS = (

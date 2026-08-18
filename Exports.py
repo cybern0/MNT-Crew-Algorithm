@@ -9,10 +9,11 @@ Le catalogue d'actions est aligne avec AlgoTrain.py :
     Imahaki  (M) : 13 actions (HACK_CUT automatique chez les grapplers,
                               donc non emis)
 
-Important : le modele et le trainer utilisent une carte 13 canaux
-(11 canaux one-hot de tuile + elevation absolue + elevation relative).
-Cet exporteur emet donc `map` avec shape [1, 13, 30, 30] pour matcher
-le modele entraine. Le preprocesseur C# doit lui aussi produire 13 canaux.
+Important : le modele et le trainer utilisent une carte 15 canaux
+(11 canaux one-hot de tuile + elevation absolue + elevation relative
++ 1 canal look-ahead excavateur + 1 canal look-ahead grappler).
+Cet exporteur emet donc `map` avec shape [1, 15, 30, 30] pour matcher
+le modele entraine. Le preprocesseur C# doit lui aussi produire 15 canaux.
 
 Usage :
 
@@ -151,8 +152,9 @@ def export_model(name: str, n_actions: int | None = None) -> None:
 
     wrapper = ONNXPolicyWrapper(policy)
 
-    # 13 canaux : 11 canaux one-hot de tuile + elevation absolue + relative.
-    map_ = torch.zeros(1, 13, 30, 30)
+    # 15 canaux (Twist) : 11 one-hot tuiles + abs elevation + rel elevation
+    #                     + next_X (look-ahead excavateur) + next_G (look-ahead grappler).
+    map_ = torch.zeros(1, 15, 30, 30)
     # 6 scalaires : stamina, batterie, temps, X, Y, isOnEngine.
     stats = torch.zeros(1, 6)
 
