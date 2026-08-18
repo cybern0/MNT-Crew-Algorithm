@@ -448,6 +448,102 @@ def parse_facing(action: str) -> tuple[int, int]:
     return FACING_VECTORS.get(action, (0, 0))
 
 
+# ---------------------------------------------------------------------------
+# CONTRAT DU MASQUE D'ACTIONS (mirror cote Godot Ikotofosa.cs / Imahaki.cs)
+# ---------------------------------------------------------------------------
+# Le flag `isOnEngine` (6eme scalaire, index 5) indique si le hero est
+# actuellement en train de pirater une machine (RidingMachine != null).
+#
+# Sans ce masque, le modele peut rester coince dans une boucle infinie
+# de HACK_CW / HACK_MOVE : il n'a jamais appris a emettre WAIT pour
+# relacher la machine, et l'environnement ne le penalise pas pour les
+# actions invalides.
+#
+# REGLE CONTRACTUELLE :
+#   - isOnEngine = True (RidingMachine != null) :
+#       VALIDES   = HACK_MOVE, HACK_FILL (F seulement), HACK_CW, HACK_CCW, WAIT
+#       INVALIDES = UP, DOWN, LEFT, RIGHT, PUSH_*, HACK
+#       (le hero est "absorbe" par la machine. WAIT = release.)
+#   - isOnEngine = False (RidingMachine == null) :
+#       VALIDES   = UP, DOWN, LEFT, RIGHT, WAIT, PUSH_*, HACK
+#       INVALIDES = HACK_MOVE, HACK_FILL, HACK_CW, HACK_CCW
+#       (le hero n'est pas sur une machine ; les HACK_* sont impossibles.)
+#
+# Cette fonction est l'autorite cote Python : l'environnement doit
+# l'utiliser pour (1) penaliser les actions invalides et (2) exposer
+# `action_mask` dans info pour les wrappers type MaskablePPO.
+# ---------------------------------------------------------------------------
+HACK_ACTIONS_F = {"HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"}
+HACK_ACTIONS_M = {"HACK_MOVE", "HACK_CW", "HACK_CCW"}
+OFF_ENGINE_ACTIONS = {
+    "UP", "DOWN", "LEFT", "RIGHT", "WAIT",
+    "PUSH_UP", "PUSH_DOWN", "PUSH_LEFT", "PUSH_RIGHT", "HACK",
+}
+
+
+def action_mask(is_on_engine: bool, action_names: list[str]) -> np.ndarray:
+    """Retourne un tableau bool[n_actions] : True = action valide.
+
+    Mirroir exact de Ikotofosa.BuildValidActionMask() / Imahaki.BuildValidActionMask().
+    A utiliser par l'environnement pour penaliser les actions invalides et
+    exposer `info["action_mask"]` pour MaskablePPO.
+    """
+    n = len(action_names)
+    mask = np.zeros(n, dtype=bool)
+    hack_set = HACK_ACTIONS_F if "HACK_FILL" in action_names else HACK_ACTIONS_M
+    for i, name in enumerate(action_names):
+        if is_on_engine:
+            # Sur engine : seules HACK_* et WAIT sont valides.
+            if name == "WAIT" or name in hack_set:
+                mask[i] = True
+        else:
+            # Hors engine : MOVE/WAIT/PUSH/HACK valides, HACK_* interdits.
+            if name in OFF_ENGINE_ACTIONS:
+                mask[i] = True
+    return mask
+
+
+class ActionMasker(gym.Wrapper):
+    """Wrapper qui expose `info["action_mask"]` calcule depuis `is_on_engine`.
+
+    RecurrentPPO ne supporte pas nativement le masking, mais ce wrapper
+    permet :
+      - de journaliser les actions invalides tentees par le modele
+      - de rester compatible avec MaskablePPO si l'utilisateur switch
+      - de garantir que l'environnement sous-jacent a bien un contrat
+        d'action_mask coherent avec cote Godot.
+
+    L'environnement sous-jacent doit exposer `is_on_engine` dans info
+    (ou implémenter sa propre methode `action_mask()`).
+    """
+
+    def __init__(self, env: gym.Env, action_names: list[str]):
+        super().__init__(env)
+        self.action_names = action_names
+
+    def _mask_from_info(self, info: dict) -> np.ndarray:
+        if "action_mask" in info and info["action_mask"] is not None:
+            return np.asarray(info["action_mask"], dtype=bool)
+        is_on = bool(info.get("is_on_engine", False))
+        return action_mask(is_on, self.action_names)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        info["action_mask"] = self._mask_from_info(info)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        mask = self._mask_from_info(info)
+        info["action_mask"] = mask
+        # Journalisation : si le modele a emis une action invalide, on
+        # l'indique dans info pour que EpisodeStatsCallback puisse la compter.
+        a = int(action)
+        if 0 <= a < len(mask) and not mask[a]:
+            info["invalid_action_attempted"] = True
+        return obs, reward, terminated, truncated, info
+
+
 def find_factory(module) -> Callable[..., gym.Env]:
     for name in ("make_env", "AlgoEnv", "AlgoGamesEnv"):
         factory = getattr(module, name, None)
@@ -581,11 +677,28 @@ class AlgoGamesEnv(gym.Env):
     """Environnement AlgoGames minimal embarque dans AlgoTrain.
 
     Ce squelette respecte le contrat d'observation attendu par le trainer.
-    Il n'implemente pas la mecanique du jeu : remplacez / etendez avec les
-    vraies regles du GDD quand le moteur est disponible. Le point critique
-    est que l'espace d'actions (Discrete(14) ou Discrete(13)) doit matcher
-    exactement ce que Exports.py produira comme ONNX.
+    Il n'implemente pas toute la mecanique du jeu (collisions, push, etc.)
+    mais il respecte DEJA le contrat du flag `isOnEngine` :
+      - suit les transitions HACK / WAIT / HACK_* pour mettre a jour l'etat
+      - penalise les actions invalides (reward = invalid_action)
+      - expose `is_on_engine` et `action_mask` dans info
+    Cela permet au modele d'etre entraene sur des observations ou isOnEngine
+    vaut tantot 0 tantot 1, evitant ainsi la boucle infinie HACK_CW/HACK_MOVE
+    a l'inference.
+
+    Remplacez / etendez avec les vraies regles du GDD quand le moteur est
+    disponible. Le point critique est que l'espace d'actions (Discrete(14)
+    ou Discrete(13)) doit matcher exactement ce que Exports.py produira
+    comme ONNX, et que le contrat du masque d'actions doit rester identique
+    a `action_mask(is_on_engine, action_names)`.
     """
+
+    # Penalties utilisees quand l'utilisateur ne fournit pas reward_config.
+    _DEFAULT_INVALID_PENALTY = -0.15
+    _DEFAULT_IDLE_PENALTY = -0.02
+    _DEFAULT_USEFUL_HACK_REWARD = 0.10
+    _MAX_BATTERY = 100.0
+    _MAX_STAMINA = 100.0
 
     def __init__(
         self,
@@ -666,40 +779,164 @@ class AlgoGamesEnv(gym.Env):
 
         self.rng = random.Random(seed)
         self._state = None
+        # Etat hack : tracking de isOnEngine pour le contrat du masque d'actions.
+        self._is_on_engine = False
+        self._battery = self._MAX_BATTERY
+        self._stamina = self._MAX_STAMINA
+        self._tick = 0
+        self._hack_action_count = 0
+
+    # ------------------------------------------------------------------
+    # Contrat du masque d'actions : mirror cote Godot (BuildValidActionMask).
+    # L'environnement concret pourra surcharger cette methode pour ajouter
+    # des contraintes specifiques (ex : HACK valide seulement si une machine
+    # est sur la case), mais le contrat de base DOIT etre respecte.
+    # ------------------------------------------------------------------
+    def action_mask(self) -> np.ndarray:
+        return action_mask(self._is_on_engine, self.action_names)
 
     def reset(self, **kwargs):
         grid = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
         scalars = np.zeros((self.scalar_count,), dtype=np.float32)
+
+        # Random start : 30% du temps, le hero demarre deja sur engine.
+        # Cela force le modele a voir isOnEngine=1 pendant l'entrainement
+        # et a apprendre a emettre WAIT pour relacher la machine.
+        self._is_on_engine = self.rng.random() < 0.30
+        self._battery = self._MAX_BATTERY
+        self._stamina = self._MAX_STAMINA
+        self._tick = 0
+        self._hack_action_count = 0
+
+        # Mettre a jour les scalaires : stamina, batterie, temps, X, Y, isOnEngine
+        scalars[0] = self._stamina / self._MAX_STAMINA
+        scalars[1] = self._battery / self._MAX_BATTERY
+        scalars[2] = 1.0  # temps restant (full au reset)
+        scalars[3] = 0.5  # position X normalisee (centre)
+        scalars[4] = 0.5  # position Y normalisee (centre)
+        scalars[5] = 1.0 if self._is_on_engine else 0.0
+
         self._state = {"grid": grid, "scalars": scalars}
-        return self._state, {
+        info = {
             "hero": self.hero,
             "hero_name": self.hero_name,
             "n_actions": self.n_actions,
+            "is_on_engine": self._is_on_engine,
+            "action_mask": self.action_mask(),
         }
+        return self._state, info
 
     def step(self, action):
-        # Pas de regles de jeu implementees : observation stable zero.
-        obs = {
-            "grid": np.copy(self._state["grid"]),
-            "scalars": np.copy(self._state["scalars"]),
-        }
+        a = int(action)
+        action_name = self.action_names[a] if 0 <= a < self.n_actions else "WAIT"
+        mask = self.action_mask()
+        is_invalid = not (0 <= a < self.n_actions and mask[a])
+
+        invalid_penalty = float(
+            self.reward_config.get("invalid_action", self._DEFAULT_INVALID_PENALTY)
+        )
+        idle_penalty = float(
+            self.reward_config.get("idle_action", self._DEFAULT_IDLE_PENALTY)
+        )
+        useful_hack_reward = float(
+            self.reward_config.get("useful_hack", self._DEFAULT_USEFUL_HACK_REWARD)
+        )
+
         reward = 0.0
         terminated = False
         truncated = False
+
+        if is_invalid:
+            # Action invalide pour l'etat courant : penalite, etat invariant.
+            reward = invalid_penalty
+            self._hack_action_count = 0  # reset streak
+        else:
+            # Transition d'etat selon l'action valide.
+            if action_name == "HACK":
+                # HACK valide seulement hors engine -> passe sur engine.
+                self._is_on_engine = True
+                self._battery = max(0.0, self._battery - 1.0)
+                self._hack_action_count = 0
+                reward = 0.0  # l'environnement reel peut donner useful_hack
+            elif action_name == "WAIT":
+                # WAIT hors engine = idle. WAIT sur engine = release.
+                if self._is_on_engine:
+                    self._is_on_engine = False
+                    self._hack_action_count = 0
+                    reward = useful_hack_reward * 0.5  # demi-recompense (squelette)
+                else:
+                    reward = idle_penalty
+            elif action_name in ("HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"):
+                # HACK_* valide seulement sur engine, consomme batterie.
+                self._battery = max(0.0, self._battery - 1.0)
+                self._hack_action_count += 1
+                # Petite recompense pour encourager les HACK_* (utiles).
+                reward = useful_hack_reward
+                # Securite anti-boucle infinie : si plus de batterie, forcer
+                # la sortie au prochain tick (l'environnement reel devrait
+                # s'occuper de ca via le GDD ; ici on tronque par securite).
+                if self._battery <= 0.0:
+                    self._is_on_engine = False
+                    self._hack_action_count = 0
+            elif action_name in ("UP", "DOWN", "LEFT", "RIGHT"):
+                # Deplacement valide hors engine : cout stamina standard.
+                self._stamina = max(0.0, self._stamina - 1.0)
+                self._hack_action_count = 0
+                reward = 0.0
+            elif action_name.startswith("PUSH_"):
+                # Push valide hors engine : cout stamina plus eleve.
+                self._stamina = max(0.0, self._stamina - 1.0)
+                self._hack_action_count = 0
+                reward = 0.0
+
+        # Avance du temps.
+        self._tick += 1
+        if self._tick >= self.max_time:
+            truncated = True
+
+        # Epuisement des ressources -> fin d'episode.
+        if self._battery <= 0.0 and self._is_on_engine:
+            # Batterie videe en hackant : on force la sortie (deja fait plus haut).
+            pass
+        if self._stamina <= 0.0:
+            terminated = True
+
+        # Mettre a jour les scalaires de l'observation.
+        scalars = np.copy(self._state["scalars"])
+        scalars[0] = self._stamina / self._MAX_STAMINA
+        scalars[1] = self._battery / self._MAX_BATTERY
+        scalars[2] = max(0.0, 1.0 - self._tick / max(1, self.max_time))
+        scalars[5] = 1.0 if self._is_on_engine else 0.0
+
+        obs = {
+            "grid": np.copy(self._state["grid"]),
+            "scalars": scalars,
+        }
+        self._state["scalars"] = scalars
+
         info = {
             "hero": self.hero,
-            "action_name": self.action_names[int(action)],
+            "action_name": action_name,
+            "is_on_engine": self._is_on_engine,
+            "action_mask": self.action_mask(),
+            "invalid_action": is_invalid,
         }
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
 class EpisodeStatsCallback(BaseCallback):
-    """Journalise par hero : episodes, actions invalides, hacks utiles, etc."""
+    """Journalise par hero : episodes, actions invalides, hacks utiles, etc.
+
+    Compte notamment les `invalid_action_attempted` signales par ActionMasker
+    pour que l'utilisateur puisse detecter en TensorBoard si le modele tente
+    d'emettre des actions invalides (ex : HACK_CW alors que isOnEngine=0).
+    """
 
     def __init__(self, hero: str):
         super().__init__()
         self.hero = hero
         self.episodes = 0
+        self.invalid_attempts = 0
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -707,6 +944,12 @@ class EpisodeStatsCallback(BaseCallback):
             if episode is not None:
                 self.episodes += 1
                 self.logger.record(f"{self.hero}/episodes", self.episodes)
+
+            # ActionMasker signale les tentatives d'actions invalides.
+            if info.get("invalid_action_attempted") or info.get("invalid_action"):
+                self.invalid_attempts += 1
+                self.logger.record(f"{self.hero}/invalid_action_attempts",
+                                   float(self.invalid_attempts))
 
             for key in (
                 "stones_collected",
@@ -755,6 +998,12 @@ def make_single_env(
         }
         env = factory(**filter_supported_kwargs(factory, kwargs))
         env = ContractEnv(env, hero=hero)
+        # Wrap avec ActionMasker pour exposer info["action_mask"] et
+        # journaliser les actions invalides. C'est le contrat mirror
+        # de BuildValidActionMask() cote Godot : sans lui, un modele
+        # mal entraene peut rester coince dans une boucle infinie de
+        # HACK_CW / HACK_MOVE a l'inference.
+        env = ActionMasker(env, action_names=HEROES[hero]["actions"])
         env = Monitor(env)
         env.reset(seed=seed + rank)
         return env
