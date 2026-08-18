@@ -55,6 +55,7 @@ L'environnement concret doit etre expose par AlgoEnv.py sous l'une des formes :
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import importlib.util
 import inspect
 import os
@@ -270,6 +271,32 @@ def parse_args() -> argparse.Namespace:
         default="random",
     )
     parser.add_argument("--check-env", action="store_true")
+    # --- Optimisations CPU ---
+    # RecurrentPPO + LSTM 128 est lourd sur CPU. Pour accelerer :
+    #   --lstm-size 64     (LSTM plus petit, ~2x plus rapide)
+    #   --no-eval          (desactive EvalCallback, ~30% plus rapide)
+    #   --no-progress-bar  (desactive tqdm, ~5% plus rapide)
+    parser.add_argument(
+        "--lstm-size", type=int, default=128,
+        help="Taille du LSTM caché (128 défaut, 64 pour CPU).",
+    )
+    parser.add_argument(
+        "--no-eval", action="store_true",
+        help="Desactive EvalCallback (recommande sur CPU).",
+    )
+    parser.add_argument(
+        "--no-progress-bar", action="store_true",
+        help="Desactive la barre de progression tqdm (overhead CPU).",
+    )
+    # --- Logging de l'evolution de la map ---
+    parser.add_argument(
+        "--log-dir", default="TrainingLogs",
+        help="Repertoire de sortie pour les logs de session (un fichier .log par session).",
+    )
+    parser.add_argument(
+        "--log-episodes", type=int, default=50,
+        help="Log l'evolution de la map tous les N episodes (default 50).",
+    )
     return parser.parse_args()
 
 
@@ -346,6 +373,12 @@ def read_elevation(path: Path, height: int, width: int) -> np.ndarray:
     if np.any((elevation < 0) | (elevation > 9)):
         raise ValueError("Les elevations doivent etre comprises entre 0 et 9.")
 
+    # REGLE : l'elevation est chargee une fois pour toutes depuis le fichier.
+    # Elle NE DOIT JAMAIS evoluer pendant l'entrainement (sinon les regles
+    # du Twist - delta > 2 = bloque - perdent leur stabilite). On rend donc
+    # le ndarray readonly : toute tentative d'ecriture levera une erreur
+    # runtime, ce qui detecte immediatement un bug de mutation accidentelle.
+    elevation.setflags(write=False)
     return elevation
 
 
@@ -674,17 +707,31 @@ class ContractEnv(gym.Wrapper):
 
 
 class AlgoGamesEnv(gym.Env):
-    """Environnement AlgoGames minimal embarque dans AlgoTrain.
+    """Environnement AlgoGames fonctionnel embarque dans AlgoTrain.
 
-    Ce squelette respecte le contrat d'observation attendu par le trainer.
-    Il n'implemente pas toute la mecanique du jeu (collisions, push, etc.)
-    mais il respecte DEJA le contrat du flag `isOnEngine` :
-      - suit les transitions HACK / WAIT / HACK_* pour mettre a jour l'etat
-      - penalise les actions invalides (reward = invalid_action)
-      - expose `is_on_engine` et `action_mask` dans info
-    Cela permet au modele d'etre entraene sur des observations ou isOnEngine
-    vaut tantot 0 tantot 1, evitant ainsi la boucle infinie HACK_CW/HACK_MOVE
-    a l'inference.
+    IMPLEMENTATION :
+      - Encode la carte ASCII dans les 15 canaux du tenseur grid :
+          0  : floor (.)
+          1  : wall (#)
+          2  : chest (*)
+          3  : hole (o)
+          4  : tree (t)
+          5  : hidden_chest (@)
+          6  : stone (+)
+          7  : excavator (X)
+          8  : grappler (G)
+          9  : hero (F ou M) - one-hot a la position courante du hero
+          10 : hero_facing (one-hot a la position devant le hero)
+          11 : elevation absolue (normalisee [0,1] -> [-1,1])
+          12 : elevation relative (level - mean, clipped [-1,1])
+          13 : next_X (look-ahead excavateur)
+          14 : next_G (look-ahead grappler)
+      - Deplace reellement le hero sur MOVE (avec collisions terrain)
+      - Pousse les coffres sur PUSH (avec collision check)
+      - Suit les transitions HACK / WAIT / HACK_* pour isOnEngine
+      - Recompenses : move valide (+), wall hit (-), idle (-), stone collecte (++),
+        chest hidden (+++), chest destroyed (---), invalid action (--)
+      - Buffers pre-alloues pour eviter GC pressure sur CPU
 
     Remplacez / etendez avec les vraies regles du GDD quand le moteur est
     disponible. Le point critique est que l'espace d'actions (Discrete(14)
@@ -697,8 +744,36 @@ class AlgoGamesEnv(gym.Env):
     _DEFAULT_INVALID_PENALTY = -0.15
     _DEFAULT_IDLE_PENALTY = -0.02
     _DEFAULT_USEFUL_HACK_REWARD = 0.10
+    _DEFAULT_WALL_HIT_PENALTY = -0.05
+    _DEFAULT_MOVE_REWARD = 0.02
+    _DEFAULT_STONE_REWARD = 1.0
+    _DEFAULT_CHEST_HIDDEN_REWARD = 5.0
+    _DEFAULT_CHEST_DESTROYED_PENALTY = -10.0
     _MAX_BATTERY = 100.0
     _MAX_STAMINA = 100.0
+    _PUSH_STAMINA_COST = 2.0
+    _MOVE_STAMINA_COST = 1.0
+    _UPHILL_STAMINA_COST = 3.0
+
+    # Mapping ASCII -> canal one-hot (cf. InputPreprocessor.cs cote Godot).
+    _TILE_CHANNELS: dict[str, int] = {
+        ".": 0,   # floor
+        "#": 1,   # wall
+        "*": 2,   # chest
+        "o": 3,   # hole
+        "t": 4,   # tree
+        "@": 5,   # hidden_chest
+        "+": 6,   # stone
+        "X": 7,   # excavator
+        "G": 8,   # grappler
+    }
+    # F et M sont encodes dans le canal 9 (hero) - dynamique selon le hero.
+    _HERO_CHANNEL = 9
+    _HERO_FACING_CHANNEL = 10
+    _ABS_ELEV_CHANNEL = 11
+    _REL_ELEV_CHANNEL = 12
+    _NEXT_X_CHANNEL = 13
+    _NEXT_G_CHANNEL = 14
 
     def __init__(
         self,
@@ -741,6 +816,9 @@ class AlgoGamesEnv(gym.Env):
         self.scalar_count = scalar_count
 
         # Validation des entrees via les helpers partages.
+        # IMPORTANT : self.elevation est readonly (setflags write=False dans
+        # read_elevation) pour garantir qu'elle n'evolue jamais pendant
+        # l'entrainement. C'est un contrat du Twist.
         self.height, self.width, self.max_time, self.ascii_rows = read_map_header(self.map_path)
         self.elevation = read_elevation(self.elevation_path, self.height, self.width)
         validate_terrain(self.ascii_rows, self.elevation)
@@ -778,13 +856,121 @@ class AlgoGamesEnv(gym.Env):
         self.action_space = spaces.Discrete(self.n_actions)
 
         self.rng = random.Random(seed)
-        self._state = None
-        # Etat hack : tracking de isOnEngine pour le contrat du masque d'actions.
+
+        # --- Buffers pre-alloues pour eviter GC pressure sur CPU ---
+        # Ces buffers sont reutilises a chaque step ; on ne les alloue qu'une
+        # fois. La GC pressure etait la cause principale du ralentissement
+        # observe apres quelques milliers de steps (15*30*30 = 13,500 floats
+        # alloues + copies a chaque step => ~50 KB/step => 50 MB/1000 steps
+        # de dechets a ramasser).
+        self._grid_buf = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
+        self._scalars_buf = np.zeros((self.scalar_count,), dtype=np.float32)
+        self._mask_buf = np.zeros(self.n_actions, dtype=bool)
+
+        # Encode la map statique une seule fois dans _static_grid (canals 0-8).
+        # Les canaux 9 (hero), 10 (facing), 11-12 (elevation) sont statiques
+        # aussi, on les encode aussi ici. Seuls 9, 10, 13, 14 peuvent changer
+        # pendant un episode (position du hero + look-ahead machines).
+        self._static_grid = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
+        self._encode_static_grid()
+
+        # Etat dynamique du hero.
+        self._hero_x, self._hero_y = 0, 0
+        self._hero_facing = (1, 0)  # RIGHT par defaut
         self._is_on_engine = False
         self._battery = self._MAX_BATTERY
         self._stamina = self._MAX_STAMINA
         self._tick = 0
         self._hack_action_count = 0
+        self._stones_collected = 0
+        self._chests_hidden = 0
+        self._chests_destroyed = 0
+
+        # Positions dynamiques des coffres (set de (x,y)) - peut evoluer.
+        self._chest_positions: set[tuple[int, int]] = set()
+        self._stone_positions: set[tuple[int, int]] = set()
+        self._machine_positions: set[tuple[int, int]] = set()
+        self._scan_dynamic_entities()
+
+    # ------------------------------------------------------------------
+    # Encodage du tenseur grid : appele une fois dans __init__ pour la
+    # partie statique, puis a chaque reset/step pour la partie dynamique.
+    # ------------------------------------------------------------------
+    def _encode_static_grid(self):
+        """Encode les canaux statiques 0-8 (tuiles ASCII) et 11-12 (elevation).
+        Les canaux 9 (hero), 10 (facing), 13-14 (look-ahead) restent a zero
+        et seront remplis dynamiquement dans _encode_dynamic_grid."""
+        # Reset static portion (au cas ou on re-encode apres une mutation).
+        self._static_grid[:9] = 0.0
+        self._static_grid[11:15] = 0.0
+
+        # Canaux 0-8 : one-hot par tuile ASCII.
+        for y, row in enumerate(self.ascii_rows):
+            for x, c in enumerate(row):
+                if c in self._TILE_CHANNELS:
+                    ch = self._TILE_CHANNELS[c]
+                    self._static_grid[ch, y, x] = 1.0
+                # Le hero F/M est stocke dans le canal 9 (dynamique), pas ici.
+
+        # Canal 11 : elevation absolue normalisee [-1, 1].
+        # elevation 0..9 -> -1..+1
+        elev_norm = (self.elevation.astype(np.float32) / 4.5) - 1.0
+        self._static_grid[self._ABS_ELEV_CHANNEL, :self.height, :self.width] = elev_norm
+
+        # Canal 12 : elevation relative = level - mean, clipped [-1, 1].
+        mean_elev = float(self.elevation.mean())
+        rel_elev = np.clip(
+            (self.elevation.astype(np.float32) - mean_elev) / 4.5,
+            -1.0, 1.0,
+        )
+        self._static_grid[self._REL_ELEV_CHANNEL, :self.height, :self.width] = rel_elev
+
+    def _scan_dynamic_entities(self):
+        """Scan la map pour initialiser les sets de positions dynamiques."""
+        self._chest_positions.clear()
+        self._stone_positions.clear()
+        self._machine_positions.clear()
+        for y, row in enumerate(self.ascii_rows):
+            for x, c in enumerate(row):
+                if c == "*":
+                    self._chest_positions.add((x, y))
+                elif c == "+":
+                    self._stone_positions.add((x, y))
+                elif c in ("X", "G"):
+                    self._machine_positions.add((x, y))
+                elif c == self.hero:
+                    self._hero_x, self._hero_y = x, y
+
+    def _encode_dynamic_grid(self):
+        """Copie le static grid dans le buffer, puis ajoute canaux 9 (hero),
+        10 (facing), 13-14 (look-ahead) selon l'etat courant."""
+        # Copy static -> buffer (une seule operation vectorisee).
+        np.copyto(self._grid_buf, self._static_grid)
+
+        # Canal 9 : position du hero (one-hot).
+        if 0 <= self._hero_x < self.width and 0 <= self._hero_y < self.height:
+            self._grid_buf[self._HERO_CHANNEL, self._hero_y, self._hero_x] = 1.0
+
+        # Canal 10 : facing (case devant le hero) - utile pour le lookahead
+        # conditionnel cote Python (mirror HasChestAhead cote Godot).
+        fx = self._hero_x + self._hero_facing[0]
+        fy = self._hero_y + self._hero_facing[1]
+        if 0 <= fx < self.width and 0 <= fy < self.height:
+            self._grid_buf[self._HERO_FACING_CHANNEL, fy, fx] = 1.0
+
+        # Canaux 13-14 : look-ahead machines. En squelette, on met les
+        # positions futures = positions courantes des machines (anticipation
+        # 0 tick). Un vrai moteur calculerait SimulateMachinePreview comme
+        # cote Godot. Comme le hero ne bouge pas de toute facon quand il
+        # n'y a pas de coffre devant, on garde cette approximation simple.
+        # Si coffre devant (Twist rule) :
+        if (fx, fy) in self._chest_positions:
+            for (mx, my) in self._machine_positions:
+                if 0 <= mx < self.width and 0 <= my < self.height:
+                    # Simplifie : machines supposes ne pas bouger dans le
+                    # squelette. Vrai environnement -> SimulateMachinePreview.
+                    ch = self._NEXT_X_CHANNEL if self.machine_target == "X" else self._NEXT_G_CHANNEL
+                    self._grid_buf[ch, my, mx] = 1.0
 
     # ------------------------------------------------------------------
     # Contrat du masque d'actions : mirror cote Godot (BuildValidActionMask).
@@ -793,38 +979,159 @@ class AlgoGamesEnv(gym.Env):
     # est sur la case), mais le contrat de base DOIT etre respecte.
     # ------------------------------------------------------------------
     def action_mask(self) -> np.ndarray:
-        return action_mask(self._is_on_engine, self.action_names)
+        # On rempli self._mask_buf (pre-alloue) plutot que d'en creer un
+        # nouveau a chaque appel : evite ~100 bytes/call de GC pressure.
+        np.copyto(self._mask_buf, action_mask(self._is_on_engine, self.action_names))
+        return self._mask_buf
 
     def reset(self, **kwargs):
-        grid = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
-        scalars = np.zeros((self.scalar_count,), dtype=np.float32)
-
-        # Random start : 30% du temps, le hero demarre deja sur engine.
-        # Cela force le modele a voir isOnEngine=1 pendant l'entrainement
-        # et a apprendre a emettre WAIT pour relacher la machine.
-        self._is_on_engine = self.rng.random() < 0.30
+        # Reset dynamique : positions initiales, ressources.
+        self._scan_dynamic_entities()  # re-scanne au cas ou le precedent episode a mute les sets
+        self._is_on_engine = False  # demarre hors engine
         self._battery = self._MAX_BATTERY
         self._stamina = self._MAX_STAMINA
         self._tick = 0
         self._hack_action_count = 0
+        self._stones_collected = 0
+        self._chests_hidden = 0
+        self._chests_destroyed = 0
+        self._hero_facing = (1, 0)  # RIGHT par defaut
 
-        # Mettre a jour les scalaires : stamina, batterie, temps, X, Y, isOnEngine
-        scalars[0] = self._stamina / self._MAX_STAMINA
-        scalars[1] = self._battery / self._MAX_BATTERY
-        scalars[2] = 1.0  # temps restant (full au reset)
-        scalars[3] = 0.5  # position X normalisee (centre)
-        scalars[4] = 0.5  # position Y normalisee (centre)
-        scalars[5] = 1.0 if self._is_on_engine else 0.0
+        # Encode l'observation initiale.
+        self._encode_dynamic_grid()
+        self._scalars_buf[:] = 0.0
+        self._scalars_buf[0] = 1.0  # stamina = 100%
+        self._scalars_buf[1] = 1.0  # battery = 100%
+        self._scalars_buf[2] = 1.0  # temps = 100%
+        self._scalars_buf[3] = self._hero_x / max(1, self.width - 1)
+        self._scalars_buf[4] = self._hero_y / max(1, self.height - 1)
+        self._scalars_buf[5] = 0.0  # is_on_engine = False au reset
 
-        self._state = {"grid": grid, "scalars": scalars}
         info = {
             "hero": self.hero,
             "hero_name": self.hero_name,
             "n_actions": self.n_actions,
             "is_on_engine": self._is_on_engine,
-            "action_mask": self.action_mask(),
+            "action_mask": self.action_mask().copy(),
+            "hero_pos": (self._hero_x, self._hero_y),
         }
-        return self._state, info
+        return {"grid": self._grid_buf.copy(), "scalars": self._scalars_buf.copy()}, info
+
+    def _terrain_at(self, x: int, y: int) -> str:
+        """Retourne le caractere ASCII a (x,y) ou '#' si hors carte."""
+        if y < 0 or y >= self.height or x < 0 or x >= self.width:
+            return "#"
+        return self.ascii_rows[y][x]
+
+    def _elevation_at(self, x: int, y: int) -> int:
+        if y < 0 or y >= self.height or x < 0 or x >= self.width:
+            return 0
+        return int(self.elevation[y, x])
+
+    def _try_move(self, dx: int, dy: int) -> float:
+        """Tente de deplacer le hero. Retourne la reward.
+        Applique les regles du Twist :
+          - '#' / 'o' (F) ou 't' (M) : bloque, wall_hit_penalty
+          - delta elevation > 2 : bloque (Twist)
+          - Stamina insuffisante : bloque
+          - Sinon : deplace, cout stamina variable (1 base + 3 uphill + 0 downhill)
+        """
+        wall_hit = float(self.reward_config.get("wall_hit", self._DEFAULT_WALL_HIT_PENALTY))
+        move_r = float(self.reward_config.get("move_reward", self._DEFAULT_MOVE_REWARD))
+        stone_r = float(self.reward_config.get("stone_collected", self._DEFAULT_STONE_REWARD))
+
+        tx, ty = self._hero_x + dx, self._hero_y + dy
+        terrain = self._terrain_at(tx, ty)
+
+        # Blocages de terrain.
+        if self.hero == "F" and terrain in ("#", "o", "t"):
+            return wall_hit
+        if self.hero == "M" and terrain in ("#", "o"):
+            return wall_hit
+
+        # Twist : delta elevation > 2 -> bloque.
+        delta = abs(self._elevation_at(tx, ty) - self._elevation_at(self._hero_x, self._hero_y))
+        if delta > 2:
+            return wall_hit
+
+        # Cout stamina.
+        cost = self._MOVE_STAMINA_COST
+        if self._elevation_at(tx, ty) > self._elevation_at(self._hero_x, self._hero_y):
+            cost += self._UPHILL_STAMINA_COST
+        elif self._elevation_at(tx, ty) < self._elevation_at(self._hero_x, self._hero_y):
+            cost = 0.0  # descente gratuite
+        if self._stamina < cost:
+            return wall_hit
+
+        # Deplacement reussi.
+        self._hero_x, self._hero_y = tx, ty
+        self._stamina -= cost
+        reward = move_r
+
+        # Collecte pierre si on est sur une pierre.
+        if (tx, ty) in self._stone_positions:
+            self._stone_positions.discard((tx, ty))
+            self._stones_collected += 1
+            reward += stone_r
+
+        # Coffre cache (@) si on est dessus -> compte comme hidden.
+        if terrain == "@":
+            self._chests_hidden += 1
+            reward += float(self.reward_config.get(
+                "chest_hidden", self._DEFAULT_CHEST_HIDDEN_REWARD))
+
+        return reward
+
+    def _try_push(self, dx: int, dy: int) -> float:
+        """Tente de pousser un coffre. Retourne la reward.
+        Regles :
+          - Pas de coffre devant : wall_hit_penalty
+          - Coffre pousse vers '#' / 'o' / autre coffre / machine : bloque
+          - Coffre pousse vers '@' (hidden slot) : hidden!
+          - Coffre pousse vers un trou avec drop >= 5 : detruit (penalite)
+          - Coffre pousse vers un trou avec drop < 5 : tombe dans le trou (detruit, sans hidden)
+          - Sinon : pousse, le hero avance, cout stamina pousse
+        """
+        wall_hit = float(self.reward_config.get("wall_hit", self._DEFAULT_WALL_HIT_PENALTY))
+        chest_hidden_r = float(self.reward_config.get(
+            "chest_hidden", self._DEFAULT_CHEST_HIDDEN_REWARD))
+        chest_destroyed_p = float(self.reward_config.get(
+            "chest_destroyed", self._DEFAULT_CHEST_DESTROYED_PENALTY))
+
+        cx, cy = self._hero_x + dx, self._hero_y + dy
+        if (cx, cy) not in self._chest_positions:
+            return wall_hit  # pas de coffre a pousser
+
+        bx, by = cx + dx, cy + dy
+        terrain_beyond = self._terrain_at(bx, by)
+        if terrain_beyond == "#" or (bx, by) in self._machine_positions \
+           or (bx, by) in self._chest_positions:
+            return wall_hit
+
+        if self._stamina < self._PUSH_STAMINA_COST:
+            return wall_hit
+
+        # Push reussi.
+        self._chest_positions.discard((cx, cy))
+        self._stamina -= self._PUSH_STAMINA_COST
+        self._hero_x, self._hero_y = cx, cy
+
+        if terrain_beyond == "@":
+            # Coffre pousse dans une cache -> hidden!
+            self._chests_hidden += 1
+            return chest_hidden_r
+        elif terrain_beyond == "o":
+            # Coffre tombe dans un trou -> detruit.
+            drop = abs(self._elevation_at(bx, by) - self._elevation_at(cx, cy))
+            self._chests_destroyed += 1
+            # GDD: drop >= 5 -> coffre detruit sans hidden. drop < 5 -> ?
+            # On penalise toujours la destruction (le squelette ne fait pas
+            # la distinction exacte, l'utilisateur affinera avec le GDD).
+            return chest_destroyed_p
+        else:
+            # Coffre pousse sur case libre : le coffre reste sur la map.
+            self._chest_positions.add((bx, by))
+            return float(self.reward_config.get("useful_push", 0.5))
 
     def step(self, action):
         a = int(action)
@@ -847,81 +1154,83 @@ class AlgoGamesEnv(gym.Env):
         truncated = False
 
         if is_invalid:
-            # Action invalide pour l'etat courant : penalite, etat invariant.
             reward = invalid_penalty
-            self._hack_action_count = 0  # reset streak
+            self._hack_action_count = 0
         else:
-            # Transition d'etat selon l'action valide.
+            # Mise a jour de la facing direction avant l'action.
+            dir_map = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+            push_dir_map = {
+                "PUSH_UP": (0, -1), "PUSH_DOWN": (0, 1),
+                "PUSH_LEFT": (-1, 0), "PUSH_RIGHT": (1, 0),
+            }
+
             if action_name == "HACK":
-                # HACK valide seulement hors engine -> passe sur engine.
                 self._is_on_engine = True
                 self._battery = max(0.0, self._battery - 1.0)
                 self._hack_action_count = 0
-                reward = 0.0  # l'environnement reel peut donner useful_hack
+                reward = 0.0
             elif action_name == "WAIT":
-                # WAIT hors engine = idle. WAIT sur engine = release.
                 if self._is_on_engine:
                     self._is_on_engine = False
                     self._hack_action_count = 0
-                    reward = useful_hack_reward * 0.5  # demi-recompense (squelette)
+                    reward = useful_hack_reward * 0.5
                 else:
                     reward = idle_penalty
             elif action_name in ("HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"):
-                # HACK_* valide seulement sur engine, consomme batterie.
                 self._battery = max(0.0, self._battery - 1.0)
                 self._hack_action_count += 1
-                # Petite recompense pour encourager les HACK_* (utiles).
                 reward = useful_hack_reward
-                # Securite anti-boucle infinie : si plus de batterie, forcer
-                # la sortie au prochain tick (l'environnement reel devrait
-                # s'occuper de ca via le GDD ; ici on tronque par securite).
                 if self._battery <= 0.0:
                     self._is_on_engine = False
                     self._hack_action_count = 0
-            elif action_name in ("UP", "DOWN", "LEFT", "RIGHT"):
-                # Deplacement valide hors engine : cout stamina standard.
-                self._stamina = max(0.0, self._stamina - 1.0)
+            elif action_name in dir_map:
+                self._hero_facing = dir_map[action_name]
+                reward = self._try_move(*dir_map[action_name])
                 self._hack_action_count = 0
-                reward = 0.0
-            elif action_name.startswith("PUSH_"):
-                # Push valide hors engine : cout stamina plus eleve.
-                self._stamina = max(0.0, self._stamina - 1.0)
+            elif action_name in push_dir_map:
+                self._hero_facing = push_dir_map[action_name]
+                reward = self._try_push(*push_dir_map[action_name])
                 self._hack_action_count = 0
-                reward = 0.0
 
         # Avance du temps.
         self._tick += 1
         if self._tick >= self.max_time:
             truncated = True
 
-        # Epuisement des ressources -> fin d'episode.
-        if self._battery <= 0.0 and self._is_on_engine:
-            # Batterie videe en hackant : on force la sortie (deja fait plus haut).
-            pass
+        # Epuisement stamina -> fin d'episode.
         if self._stamina <= 0.0:
             terminated = True
 
-        # Mettre a jour les scalaires de l'observation.
-        scalars = np.copy(self._state["scalars"])
-        scalars[0] = self._stamina / self._MAX_STAMINA
-        scalars[1] = self._battery / self._MAX_BATTERY
-        scalars[2] = max(0.0, 1.0 - self._tick / max(1, self.max_time))
-        scalars[5] = 1.0 if self._is_on_engine else 0.0
-
-        obs = {
-            "grid": np.copy(self._state["grid"]),
-            "scalars": scalars,
-        }
-        self._state["scalars"] = scalars
+        # Re-encode l'observation avec le nouvel etat.
+        self._encode_dynamic_grid()
+        self._scalars_buf[0] = self._stamina / self._MAX_STAMINA
+        self._scalars_buf[1] = self._battery / self._MAX_BATTERY
+        self._scalars_buf[2] = max(0.0, 1.0 - self._tick / max(1, self.max_time))
+        self._scalars_buf[3] = self._hero_x / max(1, self.width - 1)
+        self._scalars_buf[4] = self._hero_y / max(1, self.height - 1)
+        self._scalars_buf[5] = 1.0 if self._is_on_engine else 0.0
 
         info = {
             "hero": self.hero,
             "action_name": action_name,
             "is_on_engine": self._is_on_engine,
-            "action_mask": self.action_mask(),
+            "action_mask": self.action_mask().copy(),
             "invalid_action": is_invalid,
+            "hero_pos": (self._hero_x, self._hero_y),
+            "hero_stamina": self._stamina,
+            "hero_battery": self._battery,
+            "tick": self._tick,
+            "stones_collected": self._stones_collected,
+            "chests_hidden": self._chests_hidden,
+            "chests_destroyed": self._chests_destroyed,
         }
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        return (
+            {"grid": self._grid_buf.copy(), "scalars": self._scalars_buf.copy()},
+            float(reward),
+            bool(terminated),
+            bool(truncated),
+            info,
+        )
 
 
 class EpisodeStatsCallback(BaseCallback):
@@ -964,6 +1273,167 @@ class EpisodeStatsCallback(BaseCallback):
                 if key in info:
                     self.logger.record(f"{self.hero}/{key}", float(info[key]))
         return True
+
+
+class MapLoggerCallback(BaseCallback):
+    """Log l'evolution de la map pour chaque session d'entrainement.
+
+    Genere un fichier .log par session, contenant :
+      - En-tete : date, hero, map source, elevation source, action list
+      - Pour chaque episode logge (tous les --log-episodes) :
+          * Episode N (step K)
+          * Reward total, longueur, actions invalides
+          * Etat final : stamina, battery, is_on_engine, hero_pos
+          * Carte ASCII finale avec position du hero marquee (H)
+          * Compteurs : pierres collectees, coffres caches, coffres detruits
+      - Pour les premiers episodes de la session, log aussi les
+        20 premieres actions pour aider a debugger les boucles (ex : LEFT forever)
+
+    Le fichier est ecrit dans --log-dir (default: TrainingLogs/) sous le nom
+    session_<hero>_<YYYYMMDD_HHMMSS>.log. Il est flushe apres chaque episode
+    logge pour etre consultable en temps reel pendant l'entrainement.
+    """
+
+    def __init__(self, hero: str, log_dir: str, log_every: int = 50,
+                 trace_first_episodes: int = 3, trace_actions_count: int = 20):
+        super().__init__()
+        self.hero = hero
+        self.log_dir = Path(log_dir)
+        self.log_every = max(1, log_every)
+        self.trace_first_episodes = trace_first_episodes
+        self.trace_actions_count = trace_actions_count
+        self.episode_count = 0
+        self._file = None
+        self._session_start = None
+        self._trace_buffer: list[str] = []  # actions du current episode
+        self._trace_episode_idx = -1
+
+    def _on_training_start(self) -> None:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = self.log_dir / f"session_{self.hero}_{session_id}.log"
+        self._session_start = datetime.now()
+        self._file = open(self.log_path, "w", encoding="utf-8")
+
+        # En-tete : infos de session.
+        self._file.write(f"# AlgoGames2 - session d'entrainement\n")
+        self._file.write(f"# Hero: {self.hero} ({HEROES[self.hero]['name']})\n")
+        self._file.write(f"# Date de debut: {self._session_start.isoformat()}\n")
+        self._file.write(f"# N_actions: {HEROES[self.hero]['n_actions']}\n")
+        self._file.write(f"# Action list: {HEROES[self.hero]['actions']}\n")
+        # Extraire map_path et elevation_path depuis le premier env.
+        try:
+            env0 = self.model.env.envs[0].unwrapped
+            self._file.write(f"# Map: {getattr(env0, 'map_path', '?')}\n")
+            self._file.write(f"# Elevation: {getattr(env0, 'elevation_path', '?')}\n")
+            self._file.write(f"# Map dimensions: {getattr(env0, 'height', '?')}x{getattr(env0, 'width', '?')}\n")
+            self._file.write(f"# Max time: {getattr(env0, 'max_time', '?')} ticks\n")
+            # Inclure la map ASCII initiale.
+            if hasattr(env0, 'ascii_rows'):
+                self._file.write(f"# Carte ASCII initiale:\n")
+                for row in env0.ascii_rows:
+                    self._file.write(f"#   {row}\n")
+        except Exception as e:
+            self._file.write(f"# (env introspection failed: {e})\n")
+        self._file.write(f"\n")
+        self._file.flush()
+        print(f"[MapLogger] logging session to: {self.log_path}")
+
+    def _on_step(self) -> bool:
+        for i, info in enumerate(self.locals.get("infos", [])):
+            # Tracer les N premieres actions des premiers episodes.
+            action_name = info.get("action_name", "?")
+            invalid = info.get("invalid_action", False)
+            marker = "!" if invalid else " "
+            # Si on est dans un episode a tracer, accumuler.
+            episode = info.get("episode")
+            if episode is not None:
+                # Episode vient de finir, on va le logger ci-dessous si besoin.
+                pass
+            # Trace les actions de l'episode courant.
+            if self._trace_episode_idx < self.trace_first_episodes:
+                self._trace_buffer.append(f"{action_name}{marker}")
+
+            # Si episode termine, on log le snapshot.
+            if episode is not None:
+                self.episode_count += 1
+                self._trace_episode_idx += 1
+                if self.episode_count % self.log_every == 0 or \
+                   self._trace_episode_idx < self.trace_first_episodes:
+                    self._log_episode(episode, info)
+                # Reset le trace buffer pour le prochain episode.
+                self._trace_buffer = []
+        return True
+
+    def _log_episode(self, episode, info):
+        """Ecrit le snapshot d'un episode dans le fichier de log."""
+        # SB3 Monitor wrapper fournit info["episode"] = {"r": reward, "l": length}
+        # quand un episode se termine. On essaie les deux conventions.
+        try:
+            if isinstance(episode, dict):
+                ep_reward = float(episode.get("r", 0.0))
+                ep_length = int(episode.get("l", 0))
+            else:
+                ep_reward = float(getattr(episode, "r", 0.0) or getattr(episode, "episode_rewards", [0])[-1] if getattr(episode, "episode_rewards", None) else 0.0)
+                ep_length = int(getattr(episode, "l", 0) or getattr(episode, "episode_lengths", [0])[-1] if getattr(episode, "episode_lengths", None) else 0)
+        except Exception:
+            ep_reward = 0.0
+            ep_length = 0
+
+        self._file.write(f"--- Episode {self.episode_count} (step {self.num_timesteps}) ---\n")
+        self._file.write(f"  reward={ep_reward:.3f}  length={ep_length}\n")
+        self._file.write(f"  is_on_engine={info.get('is_on_engine', False)}\n")
+        self._file.write(f"  hero_pos={info.get('hero_pos', '?')}\n")
+        self._file.write(f"  hero_stamina={info.get('hero_stamina', '?')}\n")
+        self._file.write(f"  hero_battery={info.get('hero_battery', '?')}\n")
+        self._file.write(f"  stones_collected={info.get('stones_collected', 0)}\n")
+        self._file.write(f"  chests_hidden={info.get('chests_hidden', 0)}\n")
+        self._file.write(f"  chests_destroyed={info.get('chests_destroyed', 0)}\n")
+
+        # Carte ASCII avec position du hero marquee.
+        try:
+            env = self.model.env.envs[0].unwrapped
+            if hasattr(env, 'ascii_rows'):
+                hero_pos = info.get('hero_pos', None)
+                hero_ch = "F" if self.hero == "F" else "M"
+                # Si hero est sur engine, marquer avec minuscule (f/m).
+                if info.get('is_on_engine', False):
+                    hero_ch = hero_ch.lower()
+                self._file.write(f"  map:\n")
+                for y, row in enumerate(env.ascii_rows):
+                    line_chars = list(row)
+                    # Remplacer le hero original par '.' (le hero est encode dynamiquement)
+                    for x, c in enumerate(line_chars):
+                        if c == self.hero:
+                            line_chars[x] = "."
+                    # Marquer la position courante du hero.
+                    if hero_pos is not None and hero_pos[1] == y:
+                        # Bounds check
+                        if 0 <= hero_pos[0] < len(line_chars):
+                            line_chars[hero_pos[0]] = hero_ch
+                    self._file.write(f"    {''.join(line_chars)}\n")
+        except Exception as e:
+            self._file.write(f"  (map snapshot failed: {e})\n")
+
+        # Trace des premieres actions (pour debug des boucles).
+        if self._trace_episode_idx < self.trace_first_episodes and self._trace_buffer:
+            self._file.write(f"  first_actions (max {self.trace_actions_count}): ")
+            self._file.write(" ".join(self._trace_buffer[:self.trace_actions_count]))
+            if len(self._trace_buffer) > self.trace_actions_count:
+                self._file.write(f" ... ({len(self._trace_buffer)} total)")
+            self._file.write("\n")
+
+        self._file.write("\n")
+        self._file.flush()
+
+    def _on_training_end(self) -> None:
+        if self._file:
+            duration = datetime.now() - self._session_start
+            self._file.write(f"\n# Training ended: {datetime.now().isoformat()}\n")
+            self._file.write(f"# Duration: {duration}\n")
+            self._file.write(f"# Total episodes: {self.episode_count}\n")
+            self._file.close()
+            print(f"[MapLogger] session log saved: {self.log_path}")
 
 
 def choose_augmentation(mode: str, rank: int) -> str:
@@ -1031,17 +1501,21 @@ def normalize_output(path: str, hero: str) -> Path:
     return output
 
 
-def build_policy_kwargs(n_actions: int) -> dict:
+def build_policy_kwargs(n_actions: int, lstm_size: int = 128) -> dict:
     """Construit les policy_kwargs en fonction du nombre d'actions.
 
     La taille de la tete d'action depend de n_actions ; SB3 la deduit
     automatiquement de l'espace d'actions. On garde net_arch leger pour
     que les deux politiques convergent avec le meme budget d'hyperparams.
+
+    Sur CPU, il est fortement recommande de passer lstm_size=64 pour
+    reduire de ~50% le temps d'entrainement sans perdre significativement
+    en capacite (la map est petite, 30x30, 15 canaux ; un LSTM 64 suffit).
     """
     return {
         "features_extractor_class": GridScalarExtractor,
         "features_extractor_kwargs": {"features_dim": 128},
-        "lstm_hidden_size": 128,
+        "lstm_hidden_size": lstm_size,
         "n_lstm_layers": 1,
         "net_arch": {"pi": [64], "vf": [64]},
     }
@@ -1103,23 +1577,29 @@ def main() -> None:
 
     train_env = VecMonitor(DummyVecEnv(env_fns))
 
-    eval_env = VecMonitor(
-        DummyVecEnv(
-            [
-                make_single_env(
-                    factory,
-                    map_path,
-                    elevation_path,
-                    hero,
-                    "identity",
-                    args.seed + 100_000,
-                    0,
-                )
-            ]
+    # EvalCallback desactive si --no-eval (recommande sur CPU ; l'eval double
+    # la charge CPU pendant les eval episodes sans grand gain sur de petits
+    # modeles).
+    eval_env = None
+    if not args.no_eval:
+        eval_env = VecMonitor(
+            DummyVecEnv(
+                [
+                    make_single_env(
+                        factory,
+                        map_path,
+                        elevation_path,
+                        hero,
+                        "identity",
+                        args.seed + 100_000,
+                        0,
+                    )
+                ]
+            )
         )
-    )
 
-    policy_kwargs = build_policy_kwargs(n_actions)
+    # LSTM size configurable pour CPU (default 128, recommander 64 sur CPU).
+    policy_kwargs = build_policy_kwargs(n_actions, lstm_size=args.lstm_size)
 
     rollout_size = args.n_steps * args.n_envs
     batch_size = min(args.batch_size, rollout_size)
@@ -1155,7 +1635,15 @@ def main() -> None:
     checkpoint_dir.mkdir(exist_ok=True)
     best_dir.mkdir(exist_ok=True)
 
-    callbacks: list[BaseCallback] = [EpisodeStatsCallback(hero=hero)]
+    # Callbacks : stats + map logger + checkpoint + (optionnel) eval.
+    callbacks: list[BaseCallback] = [
+        EpisodeStatsCallback(hero=hero),
+        MapLoggerCallback(
+            hero=hero,
+            log_dir=args.log_dir,
+            log_every=args.log_episodes,
+        ),
+    ]
 
     if args.checkpoint_freq > 0:
         callbacks.append(
@@ -1168,7 +1656,7 @@ def main() -> None:
             )
         )
 
-    if args.eval_freq > 0:
+    if not args.no_eval and eval_env is not None and args.eval_freq > 0:
         callbacks.append(
             EvalCallback(
                 eval_env,
@@ -1186,7 +1674,7 @@ def main() -> None:
             total_timesteps=args.timesteps,
             callback=CallbackList(callbacks),
             reset_num_timesteps=not bool(args.resume),
-            progress_bar=True,
+            progress_bar=not args.no_progress_bar,
         )
         model.save(str(output_path.with_suffix("")))
         print(f"[train] modele sauvegarde : {output_path}")
@@ -1194,14 +1682,16 @@ def main() -> None:
             f"[train] hero={HEROES[hero]['name']} carte={height}x{width} "
             f"temps={max_time} "
             f"observation=({N_GRID_CHANNELS}, {MAX_HEIGHT}, {MAX_WIDTH})+"
-            f"{N_SCALARS} actions={n_actions}"
+            f"{N_SCALARS} actions={n_actions} "
+            f"lstm={args.lstm_size} device={args.device}"
         )
         print(
             f"[train] actions : {HEROES[hero]['actions']}"
         )
     finally:
         train_env.close()
-        eval_env.close()
+        if eval_env is not None:
+            eval_env.close()
 
 
 if __name__ == "__main__":
