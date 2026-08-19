@@ -28,6 +28,7 @@ import sys
 import torch
 import torch.nn as nn
 from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO                                      # MIGRATION MASKABLEPPO
 
 MODEL_STATE_DIR = "ModelStates"
 ONNX_OUT_DIR = "OnnxModels"
@@ -155,7 +156,7 @@ def export_model(name: str, n_actions: int | None = None) -> None:
     # le graphe en mode eager, et un mismatch device CUDA/CPU entre les poids
     # et les inputs factices leve "Expected all tensors to be on the same device".
     # En forçant device="cpu", on garantit que tout le graphe est CPU-only.
-    model = PPO.load(load_path, device="cpu")
+    model = MaskablePPO.load(load_path, device="cpu")                        # MIGRATION MASKABLEPPO
     policy = model.policy
     policy.eval()
     # Ceinture + bretelles : force le deplacement de tous les sous-modules

@@ -58,6 +58,7 @@ import argparse
 from datetime import datetime
 import importlib.util
 import inspect
+import json
 import os
 import random
 from pathlib import Path
@@ -68,8 +69,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from gymnasium import spaces
-from sb3_contrib import RecurrentPPO
-from sb3_contrib.ppo_recurrent.policies import MultiInputLstmPolicy
+from sb3_contrib import MaskablePPO                                      # MIGRATION MASKABLEPPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CallbackList,
@@ -278,10 +278,7 @@ def parse_args() -> argparse.Namespace:
     #   --lstm-size 64     (LSTM plus petit, ~2x plus rapide)
     #   --no-eval          (desactive EvalCallback, ~30% plus rapide)
     #   --no-progress-bar  (desactive tqdm, ~5% plus rapide)
-    parser.add_argument(
-        "--lstm-size", type=int, default=128,
-        help="Taille du LSTM caché (128 défaut, 64 pour CPU).",
-    )
+    # LSTM size removed: MaskablePPO is feedforward (no LSTM).      # MIGRATION MASKABLEPPO
     parser.add_argument(
         "--no-eval", action="store_true",
         help="Desactive EvalCallback (recommande sur CPU).",
@@ -1505,22 +1502,15 @@ def normalize_output(path: str, hero: str) -> Path:
     return output
 
 
-def build_policy_kwargs(n_actions: int, lstm_size: int = 128) -> dict:
-    """Construit les policy_kwargs en fonction du nombre d'actions.
+def build_policy_kwargs(n_actions: int) -> dict:                         # MIGRATION MASKABLEPPO
+    """Construit les policy_kwargs pour une politique feedforward.
 
-    La taille de la tete d'action depend de n_actions ; SB3 la deduit
-    automatiquement de l'espace d'actions. On garde net_arch leger pour
-    que les deux politiques convergent avec le meme budget d'hyperparams.
-
-    Sur CPU, il est fortement recommande de passer lstm_size=64 pour
-    reduire de ~50% le temps d'entrainement sans perdre significativement
-    en capacite (la map est petite, 30x30, 15 canaux ; un LSTM 64 suffit).
+    MaskablePPO utilise une `ActorCriticPolicy` feedforward. On retire
+    toute configuration LSTM et on garde un `net_arch` léger.
     """
     return {
         "features_extractor_class": GridScalarExtractor,
         "features_extractor_kwargs": {"features_dim": 128},
-        "lstm_hidden_size": lstm_size,
-        "n_lstm_layers": 1,
         "net_arch": {"pi": [64], "vf": [64]},
     }
 
@@ -1609,8 +1599,8 @@ def main() -> None:
             )
         )
 
-    # LSTM size configurable pour CPU (default 128, recommander 64 sur CPU).
-    policy_kwargs = build_policy_kwargs(n_actions, lstm_size=args.lstm_size)
+    # MaskablePPO feedforward policy kwargs (lstm removed).            # MIGRATION MASKABLEPPO
+    policy_kwargs = build_policy_kwargs(n_actions)
 
     rollout_size = args.n_steps * args.n_envs
     batch_size = min(args.batch_size, rollout_size)
@@ -1619,27 +1609,38 @@ def main() -> None:
 
     if args.resume:
         resume_path = resolve_file(args.resume, "Modele a reprendre")
-        model = RecurrentPPO.load(
+        model = MaskablePPO.load(                                            # MIGRATION MASKABLEPPO
             str(resume_path),
             env=train_env,
             device=args.device,
         )
     else:
-        model = RecurrentPPO(
-            policy=MultiInputLstmPolicy,
-            env=train_env,
-            device=args.device,
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            seed=args.seed,
-            learning_rate=args.learning_rate,
-            n_steps=args.n_steps,
-            batch_size=batch_size,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-            ent_coef=args.ent_coef,
-            tensorboard_log=str(output_path.parent / f"tensorboard_{hero}"),
-        )
+        best_params_path = Path("best_hyperparams.json")
+        best_params: dict[str, Any] = {}
+        if best_params_path.exists():
+            with best_params_path.open("r", encoding="utf-8") as f:
+                best_params = json.load(f)
+            print(f"[train] hyperparametres Optuna charges depuis {best_params_path}: {best_params}")
+        else:
+            print(f"[train] aucun fichier Optuna trouve ({best_params_path.name}); utilisation des parametres par defaut.")
+
+        model_kwargs: dict[str, Any] = {
+            "policy": "MultiInputPolicy",                                 # MIGRATION MASKABLEPPO
+            "env": train_env,
+            "device": args.device,
+            "policy_kwargs": policy_kwargs,
+            "verbose": 1,
+            "seed": args.seed,
+            "learning_rate": args.learning_rate,
+            "n_steps": args.n_steps,
+            "batch_size": batch_size,
+            "gamma": args.gamma,
+            "gae_lambda": args.gae_lambda,
+            "ent_coef": args.ent_coef,
+            "tensorboard_log": str(output_path.parent / f"tensorboard_{hero}"),
+        }
+        model_kwargs.update(best_params)
+        model = MaskablePPO(**model_kwargs)                                # MIGRATION MASKABLEPPO
 
     checkpoint_dir = output_path.parent / f"checkpoints_{hero}"
     best_dir = output_path.parent / f"best_{hero}"
@@ -1694,7 +1695,7 @@ def main() -> None:
             f"temps={max_time} "
             f"observation=({N_GRID_CHANNELS}, {MAX_HEIGHT}, {MAX_WIDTH})+"
             f"{N_SCALARS} actions={n_actions} "
-            f"lstm={args.lstm_size} device={args.device}"
+            f"policy=feedforward device={args.device}"
         )
         print(
             f"[train] actions : {HEROES[hero]['actions']}"
