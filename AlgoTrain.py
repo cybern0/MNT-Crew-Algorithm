@@ -70,11 +70,11 @@ import torch
 import torch.nn as nn
 from gymnasium import spaces
 from sb3_contrib import MaskablePPO                                      # MIGRATION MASKABLEPPO
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback   # MIGRATION MASKABLEPPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CallbackList,
     CheckpointCallback,
-    EvalCallback,
 )
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
@@ -564,6 +564,11 @@ class ActionMasker(gym.Wrapper):
     def __init__(self, env: gym.Env, action_names: list[str]):
         super().__init__(env)
         self.action_names = action_names
+        # Cache mis a jour a chaque reset()/step() ; c'est ce cache que
+        # action_masks() (voir plus bas) renvoie. Valeur par defaut avant
+        # le premier reset() : tout autorise, jamais utilisee en pratique
+        # puisque SB3 appelle toujours reset() avant collect_rollouts().
+        self._current_mask = np.ones(len(action_names), dtype=bool)
 
     def _mask_from_info(self, info: dict) -> np.ndarray:
         if "action_mask" in info and info["action_mask"] is not None:
@@ -571,14 +576,31 @@ class ActionMasker(gym.Wrapper):
         is_on = bool(info.get("is_on_engine", False))
         return action_mask(is_on, self.action_names)
 
+    # -----------------------------------------------------------------
+    # MIGRATION MASKABLEPPO : contrat officiel MaskableEnv de sb3_contrib.
+    # sb3_contrib.common.maskable.utils.is_masking_supported()/
+    # get_action_masks() cherchent une methode nommee EXACTEMENT
+    # `action_masks` (pluriel, sans argument). Ni `info["action_mask"]`
+    # ni une methode `action_mask()` (singulier, cf. AlgoGamesEnv) ne
+    # remplissent ce contrat -> c'est la cause de
+    # "ValueError: Environment does not support action masking."
+    # On expose donc le cache ici ; DummyVecEnv/VecMonitor le trouveront
+    # via env_method("action_masks") en traversant les gym.Wrapper
+    # (Monitor -> ActionMasker) grace au __getattr__ standard de Wrapper.
+    # -----------------------------------------------------------------
+    def action_masks(self) -> np.ndarray:
+        return self._current_mask
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        info["action_mask"] = self._mask_from_info(info)
+        self._current_mask = self._mask_from_info(info)
+        info["action_mask"] = self._current_mask
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         mask = self._mask_from_info(info)
+        self._current_mask = mask
         info["action_mask"] = mask
         # Journalisation : si le modele a emis une action invalide, on
         # l'indique dans info pour que EpisodeStatsCallback puisse la compter.
@@ -1682,7 +1704,7 @@ def main() -> None:
 
     if not args.no_eval and eval_env is not None and args.eval_freq > 0:
         callbacks.append(
-            EvalCallback(
+            MaskableEvalCallback(                                       # MIGRATION MASKABLEPPO
                 eval_env,
                 best_model_save_path=str(best_dir),
                 log_path=str(best_dir),
@@ -1690,6 +1712,7 @@ def main() -> None:
                 n_eval_episodes=5,
                 deterministic=True,
                 render=False,
+                use_masking=True,                                       # MIGRATION MASKABLEPPO
             )
         )
 
