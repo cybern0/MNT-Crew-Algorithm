@@ -5,3 +5,5 @@ sb3-contrib
 torch
 onnx
 optuna
+onnxruntime
+pytest

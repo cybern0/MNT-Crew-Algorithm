@@ -54,6 +54,63 @@ def _augment(rows, elevation, mode):
     return ["".join(r) for r in m], np.ascontiguousarray(e, dtype=elevation.dtype)
 
 
+def build_grid(engine: GameEngine, hero: str, elevation: np.ndarray,
+                engine_config: dict, grid_channels: int = N_GRID_CHANNELS) -> np.ndarray:
+    """Encodage 15 canaux (contrat AlgoGamesEnv/ONNX). Fonction libre pour
+    pouvoir etre appelee hors gym.Env (ex: script d'inference ONNX)."""
+    g = np.zeros((grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
+    e = engine
+    for y in range(e.H):
+        row = e.terrain[y]
+        for x in range(e.W):
+            ch = _TILE_CHANNELS.get(row[x])
+            if ch is not None:
+                g[ch, y, x] = 1.0
+    for cx, cy in e.chests:
+        g[_TILE_CHANNELS["*"], cy, cx] = 1.0
+    for sx, sy in e.stones:
+        g[_TILE_CHANNELS["+"], sy, sx] = 1.0
+    for m in e.machines:
+        g[_TILE_CHANNELS[m["type"]], m["y"], m["x"]] = 1.0
+
+    hx, hy = e.pos[hero]
+    g[_HERO_CH, hy, hx] = 1.0
+    fdx, fdy = e.facing[hero]
+    fx, fy = hx + fdx, hy + fdy
+    facing_in_bounds = e.in_bounds(fx, fy)
+    if facing_in_bounds:
+        g[_FACING_CH, fy, fx] = 1.0
+
+    elev = elevation.astype(np.float32)
+    g[_ABS_ELEV_CH, :e.H, :e.W] = (elev / 4.5) - 1.0
+    mean_elev = float(elev.mean())
+    g[_REL_ELEV_CH, :e.H, :e.W] = np.clip((elev - mean_elev) / 4.5, -1.0, 1.0)
+
+    if engine_config.get("look_ahead", True):
+        only_if_chest = engine_config.get("lookahead_only_if_chest_ahead", True)
+        chest_ahead = facing_in_bounds and e.chest_at(fx, fy) is not None
+        if chest_ahead or not only_if_chest:
+            preview = e.preview_machine_positions(LOOKAHEAD_TICKS)
+            for px, py in preview["X"]:
+                g[_NEXT_X_CH, py, px] = 1.0
+            for px, py in preview["G"]:
+                g[_NEXT_G_CH, py, px] = 1.0
+    return g
+
+
+def build_scalars(engine: GameEngine, hero: str, scalar_count: int = N_SCALARS) -> np.ndarray:
+    e = engine
+    s = np.zeros((scalar_count,), dtype=np.float32)
+    hx, hy = e.pos[hero]
+    s[0] = np.clip(e.stamina[hero] / 100.0, 0.0, 1.0)
+    s[1] = np.clip(e.battery[hero] / 100.0, 0.0, 1.0)
+    s[2] = np.clip((e.max_time - e.tick) / e.max_time, 0.0, 1.0) if e.max_time > 0 else 0.0
+    s[3] = np.clip(hx / max(1, e.W - 1), 0.0, 1.0)
+    s[4] = np.clip(hy / max(1, e.H - 1), 0.0, 1.0)
+    s[5] = 1.0 if e.on_engine[hero] is not None else 0.0
+    return s
+
+
 class AlgoEnv(gym.Env):
     """1 instance = 1 hero controle ('F' ou 'M'). L'autre hero est pilote par
     GameEngine.scripted_action() (heuristique simple, sujette au meme
@@ -97,56 +154,10 @@ class AlgoEnv(gym.Env):
 
     # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
     def _build_grid(self):
-        g = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
-        e = self.engine
-        for y in range(e.H):
-            row = e.terrain[y]
-            for x in range(e.W):
-                ch = _TILE_CHANNELS.get(row[x])
-                if ch is not None:
-                    g[ch, y, x] = 1.0
-        for cx, cy in e.chests:
-            g[_TILE_CHANNELS["*"], cy, cx] = 1.0
-        for sx, sy in e.stones:
-            g[_TILE_CHANNELS["+"], sy, sx] = 1.0
-        for m in e.machines:
-            g[_TILE_CHANNELS[m["type"]], m["y"], m["x"]] = 1.0
-
-        hx, hy = e.pos[self.hero]
-        g[_HERO_CH, hy, hx] = 1.0
-        fdx, fdy = e.facing[self.hero]
-        fx, fy = hx + fdx, hy + fdy
-        facing_in_bounds = e.in_bounds(fx, fy)
-        if facing_in_bounds:
-            g[_FACING_CH, fy, fx] = 1.0
-
-        elev = self.elevation.astype(np.float32)
-        g[_ABS_ELEV_CH, :e.H, :e.W] = (elev / 4.5) - 1.0
-        mean_elev = float(elev.mean())
-        g[_REL_ELEV_CH, :e.H, :e.W] = np.clip((elev - mean_elev) / 4.5, -1.0, 1.0)
-
-        if self.engine_config.get("look_ahead", True):
-            only_if_chest = self.engine_config.get("lookahead_only_if_chest_ahead", True)
-            chest_ahead = facing_in_bounds and e.chest_at(fx, fy) is not None
-            if chest_ahead or not only_if_chest:
-                preview = e.preview_machine_positions(LOOKAHEAD_TICKS)
-                for px, py in preview["X"]:
-                    g[_NEXT_X_CH, py, px] = 1.0
-                for px, py in preview["G"]:
-                    g[_NEXT_G_CH, py, px] = 1.0
-        return g
+        return build_grid(self.engine, self.hero, self.elevation, self.engine_config, self.grid_channels)
 
     def _build_scalars(self):
-        e = self.engine
-        s = np.zeros((self.scalar_count,), dtype=np.float32)
-        hx, hy = e.pos[self.hero]
-        s[0] = np.clip(e.stamina[self.hero] / 100.0, 0.0, 1.0)
-        s[1] = np.clip(e.battery[self.hero] / 100.0, 0.0, 1.0)
-        s[2] = np.clip((e.max_time - e.tick) / e.max_time, 0.0, 1.0) if e.max_time > 0 else 0.0
-        s[3] = np.clip(hx / max(1, e.W - 1), 0.0, 1.0)
-        s[4] = np.clip(hy / max(1, e.H - 1), 0.0, 1.0)
-        s[5] = 1.0 if e.on_engine[self.hero] is not None else 0.0
-        return s
+        return build_scalars(self.engine, self.hero, self.scalar_count)
 
     def _obs(self):
         return {"grid": self._build_grid(), "scalars": self._build_scalars()}
