@@ -23,15 +23,52 @@ _TILE_CHANNELS = {".": 0, "#": 1, "*": 2, "o": 3, "t": 4, "@": 5, "+": 6, "X": 7
 _HERO_CH, _FACING_CH, _ABS_ELEV_CH, _REL_ELEV_CH, _NEXT_X_CH, _NEXT_G_CH = 9, 10, 11, 12, 13, 14
 
 _STREAK_LIMIT = 5
+_IDLE_STREAK_LIMIT = 15  # au dela, WAIT continue d'etre penalise en plus de idle_action
 _RESOURCE_LOW_TICKS_LIMIT = 10
 _SCORE_BONUS_SCALE = 0.02  # bonus terminal = score officiel GDD * scale
 
+# ---------------------------------------------------------------------------
+# REDESIGN RECOMPENSE (cf. diagnostic "politique degenere en WAIT permanent") :
+#
+# Constat empirique : sur 10k timesteps, les 30 trials Optuna convergeaient
+# TOUS vers le meme score (au bit pres), quels que soient les hyperparametres
+# testes -> preuve que la politique tombe sur un point fixe trivial (WAIT
+# partout) independant des hyperparametres. Cause racine, dans l'ancien
+# bareme :
+#   1. Un `move` reussi qui ne ramasse pas de pierre ne rapportait RIEN
+#      d'autre que `progress_to_objective` (poids 0.05) -> seul signal pour
+#      inciter a bouger, et il est minuscule.
+#   2. `voluntary_chest_loss` (-75) valait ~3750x le cout d'un WAIT (-0.02) :
+#      une seule maladresse pendant l'exploration aleatoire initiale suffit
+#      a rendre l'esperance de toute action risquee tres negative.
+#   3. WAIT n'avait aucun cout croissant : attendre indefiniment restait la
+#      strategie la moins pire, pour toujours.
+#
+# Correctifs (les 3 sont complementaires, aucun ne suffit seul) :
+#   - progress_to_objective x5 (0.05 -> 0.25) : signal dense a chaque tick,
+#     domine desormais le bruit d'une pénalité isolee sur un episode de
+#     500 ticks (jusqu'a +125 cumules si l'agent progresse constamment).
+#   - voluntary_chest_loss / chest_destroyed largement reduits (-75 -> -20,
+#     -35 -> -10) : reste clairement dissuasif mais n'ecrase plus a lui
+#     seul des dizaines de ticks de bon comportement dans l'estimation
+#     d'avantage de PPO.
+#   - prolonged_block adouci (-1.00 -> -0.50) : les series d'actions
+#     invalides pendant l'exploration aleatoire du debut ne doivent pas
+#     etre punies aussi durement qu'une perte de coffre volontaire.
+#   - idle_streak_penalty (nouveau) : au-dela de _IDLE_STREAK_LIMIT WAIT
+#     consecutifs, chaque WAIT supplementaire coute idle_action +
+#     idle_streak_penalty. Un episode 100% WAIT (500 ticks) coute desormais
+#     15*(-0.02) + 485*(-0.02-0.10) ~= -58.5, largement pire qu'une seule
+#     maladresse (-20), donc WAIT-permanent n'est plus un optimum local
+#     "sur" -- l'agent est force a explorer.
+# ---------------------------------------------------------------------------
 _REWARD_DEFAULTS = dict(
     stone_collected=25.0, chest_hidden=150.0,
     strategic_action=0.30, useful_hack=0.75, useful_fill=1.00, useful_cut=1.00,
-    useful_push=0.50, progress_to_objective=0.05,
-    invalid_action=-0.15, idle_action=-0.02, prolonged_block=-1.00,
-    chest_destroyed=-35.0, voluntary_chest_loss=-75.0,
+    useful_push=0.50, progress_to_objective=0.25,
+    invalid_action=-0.15, idle_action=-0.02, prolonged_block=-0.50,
+    idle_streak_penalty=-0.10,
+    chest_destroyed=-10.0, voluntary_chest_loss=-20.0,
     resource_exhausted=-5.0, timeout=0.0,
 )
 
@@ -150,6 +187,7 @@ class AlgoEnv(gym.Env):
         self._np_rng = np.random.default_rng(seed)
         self.engine: GameEngine | None = None
         self._invalid_streak = 0
+        self._idle_streak = 0
         self._prev_dist = 0
 
     # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
@@ -193,6 +231,7 @@ class AlgoEnv(gym.Env):
             seed=int(self._np_rng.integers(0, 2**31 - 1)),
         )
         self._invalid_streak = 0
+        self._idle_streak = 0
         self._prev_dist = self._nearest_objective_dist()
         return self._obs(), self._info()
 
@@ -228,15 +267,28 @@ class AlgoEnv(gym.Env):
         if not my["valid"]:
             r = rc["invalid_action"]
             self._invalid_streak += 1
+            self._idle_streak = 0  # une tentative (meme ratee) n'est pas de la passivite
             if self._invalid_streak >= _STREAK_LIMIT:
                 r += rc["prolonged_block"]
             return r
         self._invalid_streak = 0
         r = 0.0
         kind = my["kind"]
+
+        # Suivi de la serie de WAIT consecutifs (kind=="wait" = attente HORS
+        # engine, choix delibere de ne rien faire ; distinct de "unhack"/
+        # "ride_wait" qui sont des ticks forces par la mecanique et ne
+        # doivent pas etre penalises comme de la passivite).
+        if kind == "wait":
+            self._idle_streak += 1
+        else:
+            self._idle_streak = 0
+
         if kind == "wait":
             if self.engine.stamina[self.hero] >= 100.0:
                 r += rc["idle_action"]
+            if self._idle_streak > _IDLE_STREAK_LIMIT:
+                r += rc["idle_streak_penalty"]
         elif kind == "hack":
             r += rc["useful_hack"]
         elif kind == "hack_blocked_rotate":

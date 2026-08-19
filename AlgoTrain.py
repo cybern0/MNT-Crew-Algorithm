@@ -179,6 +179,26 @@ DEFAULT_ENGINE_CONFIG = {
     "resource_exhaustion_first": True,
 }
 
+# IMPORTANT : make_single_env() passe TOUJOURS ce dict explicitement a
+# l'environnement (AlgoEnv/AlgoGamesEnv), donc c'est CE dict-ci qui pilote
+# reellement l'entrainement -- pas _REWARD_DEFAULTS dans AlgoEnv.py (qui
+# n'est qu'un fallback si reward_config=None). Les deux sont maintenus
+# synchronises manuellement ; voir AlgoEnv.py pour le detail du redesign.
+#
+# REDESIGN (cf. diagnostic "politique degenere en WAIT permanent" observe
+# apres migration MaskablePPO) :
+#   - progress_to_objective x5 (0.05 -> 0.25) : c'etait le SEUL signal
+#     recompensant un `move` qui ne ramasse pas de pierre -> trop faible
+#     pour justifier le risque de bouger.
+#   - voluntary_chest_loss / chest_destroyed fortement reduits
+#     (-75 -> -20, -35 -> -10) : une maladresse pendant l'exploration
+#     aleatoire du debut ne doit pas a elle seule rendre negative
+#     l'esperance de toute action.
+#   - prolonged_block adouci (-1.00 -> -0.50).
+#   - idle_streak_penalty (nouveau, cf. AlgoEnv._IDLE_STREAK_LIMIT) :
+#     WAIT reste gratuit au debut (recuperation stamina legitime) mais
+#     devient couteux au-dela de 15 ticks consecutifs -> "WAIT partout"
+#     n'est plus l'optimum local le moins risque.
 DEFAULT_REWARD_CONFIG = {
     # Objectifs principaux.
     "stone_collected": 25.0,
@@ -190,14 +210,15 @@ DEFAULT_REWARD_CONFIG = {
     "useful_fill": 1.00,
     "useful_cut": 1.00,
     "useful_push": 0.50,
-    "progress_to_objective": 0.05,
+    "progress_to_objective": 0.25,
 
     # Penalites.
     "invalid_action": -0.15,
     "idle_action": -0.02,
-    "prolonged_block": -1.00,
-    "chest_destroyed": -35.0,
-    "voluntary_chest_loss": -75.0,
+    "prolonged_block": -0.50,
+    "idle_streak_penalty": -0.10,
+    "chest_destroyed": -10.0,
+    "voluntary_chest_loss": -20.0,
     "resource_exhausted": -5.0,
     "timeout": 0.0,
 }
