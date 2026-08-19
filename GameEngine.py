@@ -22,7 +22,9 @@ CCW = {v: k for k, v in CW.items()}
 MOVE_STAMINA = 1.0
 
 _DEFAULTS = dict(
-    hero_height_block=2, machine_height_block=5,
+    # Twist : seuils asymetriques heros (montee bloquee a >=3, descente a >=5).
+    hero_uphill_block=3, hero_downhill_block=5, machine_height_block=5,
+    machine_chest_uphill_block=3,  # machine ne pousse un coffre en montee que si diff < 3
     uphill_stamina_cost=3.0, downhill_stamina_cost=0.0,
     forbid_chest_uphill=True, destroy_chest_drop=5,
     chest_push_stamina_cost=5.0, hole_hop_stamina_cost=10.0, tree_climb_stamina_cost=10.0,
@@ -102,8 +104,12 @@ class GameEngine:
         return self.chests_hidden * 150 + self.stones_collected * 25 + (s + b) // 4 + t // 2
 
     def _elev_blocked(self, kind, x0, y0, x1, y1):
-        thr = self.cfg["hero_height_block"] if kind in ("F", "M") else self.cfg["machine_height_block"]
-        return abs(self.elev(x1, y1) - self.elev(x0, y0)) >= thr
+        d = self.elev(x1, y1) - self.elev(x0, y0)
+        if kind in ("F", "M"):
+            if d > 0:
+                return d >= self.cfg["hero_uphill_block"]
+            return (-d) >= self.cfg["hero_downhill_block"]
+        return abs(d) >= self.cfg["machine_height_block"]
 
     # ---- deplacement heros ----------------------------------------------
     def _hero_target(self, hero, dx, dy):
@@ -167,6 +173,64 @@ class GameEngine:
         return (idx, cx, cy, bx, by, bt)
 
     # ---- machines ---------------------------------------------------------
+    def _machine_push_plan(self, m, cx, cy):
+        """Coffre en (cx,cy) (== cible de la machine) : plan de poussee ou None.
+        Twist : montee autorisee seulement si diff < machine_chest_uphill_block."""
+        dx, dy = m["facing"]
+        idx = self.chest_at(cx, cy)
+        if idx is None:
+            return None
+        bx, by = cx + dx, cy + dy
+        if not self.in_bounds(bx, by):
+            return None
+        bt = self.terrain[by][bx]
+        if bt in ('#', 't'):
+            return None
+        d = self.elev(bx, by) - self.elev(cx, cy)
+        if d > 0 and d >= self.cfg["machine_chest_uphill_block"]:
+            return None
+        if self.chest_at(bx, by) is not None or self.machine_at(bx, by) is not None:
+            return None
+        if self.hero_at(bx, by) is not None:
+            return None
+        return (idx, cx, cy, bx, by, bt)
+
+    def _lookahead_triangle(self, cx, cy, dx, dy):
+        px, py = -dy, dx
+        return (cx + px, cy + py), (cx + dx, cy + dy), (cx - px, cy - py)
+
+    def _machine_lookahead_blocked(self, m, target):
+        """Twist : scan des 3 cellules devant la cible (perpendiculaires +
+        2 cases devant) pour d'autres machines avant de bouger/pousser. Si un
+        coffre est sur la cible, le scan s'etend a la case d'atterrissage du
+        coffre (machines) et verifie F/M sur les 3 cases pres du coffre. Si un
+        coffre est pres (pas sur) la cible, verifie F/M juste derriere lui
+        (il pourrait le pousser sur la cible)."""
+        dx, dy = m["facing"]
+        tx, ty = target
+        scan = self._lookahead_triangle(tx, ty, dx, dy)
+
+        def has_machine(p):
+            return self.in_bounds(*p) and self.machine_at(*p) is not None
+
+        def has_hero(p):
+            return self.in_bounds(*p) and self.hero_at(*p) is not None
+
+        if self.chest_at(tx, ty) is not None:
+            lx, ly = scan[1]  # case d'atterrissage du coffre pousse
+            land = self._lookahead_triangle(lx, ly, dx, dy)
+            if any(has_machine(p) for p in scan) or any(has_machine(p) for p in land):
+                return True
+            return any(has_hero(p) for p in scan)
+
+        if any(has_machine(p) for p in scan):
+            return True
+        offsets = ((-dy, dx), (dx, dy), (dy, -dx))
+        for p, off in zip(scan, offsets):
+            if self.chest_at(*p) is not None and has_hero((p[0] + off[0], p[1] + off[1])):
+                return True
+        return False
+
     def _machine_target(self, m):
         dx, dy = m["facing"]
         tx, ty = m["x"] + dx, m["y"] + dy
@@ -184,7 +248,12 @@ class GameEngine:
             return None
         if self._elev_blocked(m["type"], m["x"], m["y"], tx, ty):
             return None
-        return (tx, ty)
+        push = self._machine_push_plan(m, tx, ty)
+        if self.chest_at(tx, ty) is not None and push is None:
+            return None
+        if self._machine_lookahead_blocked(m, (tx, ty)):
+            return None
+        return (tx, ty, push)
 
     def _rotate(self, m):
         m["facing"] = CCW[m["facing"]] if m["type"] == 'X' else CW[m["facing"]]
@@ -255,6 +324,7 @@ class GameEngine:
         ev = {h: {"valid": False, "kind": "invalid"} for h in ("F", "M")}
         intents = {}
         push_plan = {}
+        machine_push_plan = {}
 
         for h in ("F", "M"):
             a = actions.get(h, "WAIT")
@@ -264,10 +334,20 @@ class GameEngine:
                 if self.hero_move_pending[h]:
                     # Tick d'execution du HACK_MOVE precedent : le hero est force en
                     # attente, la machine termine son mouvement (resolu plus bas avec
-                    # le meme mecanisme de look-ahead que les autres movers).
+                    # le meme mecanisme de look-ahead que les autres movers). Le
+                    # look-ahead a priorite sur le hacking (/!\ GDD addendum) : si
+                    # bloque, la machine ne bouge pas et ne se reoriente pas non plus
+                    # (implicit WAIT), _machine_target renvoie alors None ici.
                     ev[h] = {"valid": True, "kind": "ride_wait"}
+                    idx = self.on_engine[h]
                     tgt = self._machine_target(m)
-                    intents[("machine", self.on_engine[h])] = tgt if tgt is not None else (m["x"], m["y"])
+                    if tgt is None:
+                        intents[("machine", idx)] = (m["x"], m["y"])
+                    else:
+                        tx, ty, push = tgt
+                        intents[("machine", idx)] = (tx, ty)
+                        if push is not None:
+                            machine_push_plan[idx] = push
                     continue
                 if a == "WAIT":
                     ev[h] = {"valid": True, "kind": "unhack"}
@@ -358,7 +438,10 @@ class GameEngine:
                     m["move_pending"] = False
                     self._rotate(m)
                 else:
-                    intents[("machine", i)] = tgt
+                    tx, ty, push = tgt
+                    intents[("machine", i)] = (tx, ty)
+                    if push is not None:
+                        machine_push_plan[i] = push
             else:
                 tgt = self._machine_target(m)
                 if tgt is None:
@@ -376,10 +459,14 @@ class GameEngine:
             for h, plan in push_plan.items():
                 if ("hero", h) in blocked:
                     continue
-                chest_targets.setdefault((plan[1], plan[2]), []).append(h)
-            for hs in chest_targets.values():
-                if len(hs) > 1:
-                    blocked.update(("hero", h) for h in hs)
+                chest_targets.setdefault((plan[1], plan[2]), []).append(("hero", h))
+            for i, plan in machine_push_plan.items():
+                if ("machine", i) in blocked:
+                    continue
+                chest_targets.setdefault((plan[1], plan[2]), []).append(("machine", i))
+            for keys in chest_targets.values():
+                if len(keys) > 1:
+                    blocked.update(keys)
 
         for key, dest in intents.items():
             kind, ident = key
@@ -432,6 +519,17 @@ class GameEngine:
                         ev[rider]["kind"] = "cut"
                 if (nx, ny) in self.stones:
                     self.stones.discard((nx, ny))
+                if ident in machine_push_plan:
+                    _, cx, cy, bx, by, bt = machine_push_plan[ident]
+                    cidx = self.chest_at(cx, cy)
+                    if cidx is not None:
+                        drop = self.elev(cx, cy) - self.elev(bx, by)
+                        if drop >= self.cfg["destroy_chest_drop"] or bt == 'o':
+                            del self.chests[cidx]; self.chests_destroyed += 1
+                        elif bt == '@':
+                            del self.chests[cidx]; self.chests_hidden += 1
+                        else:
+                            self.chests[cidx][0], self.chests[cidx][1] = bx, by
                 m["steps"] += 1
                 if m["type"] == 'X' and m["steps"] >= self.cfg["machine_dig_every"]:
                     if self.terrain[ny][nx] != '#':
