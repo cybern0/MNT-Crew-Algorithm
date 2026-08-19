@@ -228,6 +228,8 @@ class AlgoEnv(gym.Env):
                 r += rc["idle_action"]
         elif kind == "hack":
             r += rc["useful_hack"]
+        elif kind == "hack_blocked_rotate":
+            r += rc["invalid_action"]
         elif kind in ("hack_move_queued", "hack_cw", "hack_ccw"):
             r += rc["strategic_action"]
         elif kind == "fill":

@@ -1441,7 +1441,9 @@ class MapLoggerCallback(BaseCallback):
 def choose_augmentation(mode: str, rank: int) -> str:
     if mode == "all":
         return AUGMENTATIONS[rank % len(AUGMENTATIONS)]
-    return mode
+    if mode == "random":
+        return random.choice(AUGMENTATIONS)
+    return mode if mode in AUGMENTATIONS else "identity"
 
 
 def make_single_env(

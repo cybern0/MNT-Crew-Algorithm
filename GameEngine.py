@@ -358,7 +358,9 @@ class GameEngine:
                     if a == "HACK_MOVE":
                         tgt = self._machine_target(m)
                         if tgt is None:
-                            self._rotate(m)
+                            # Addendum : si la machine est bloquee par le look-ahead,
+                            # l'attaque n'induire ni rotation ni mouvement ; on
+                            # laisse implicitement le hero en attente.
                             ev[h] = {"valid": True, "kind": "hack_blocked_rotate"}
                         else:
                             # Tick d'anticipation (GDD: HACK_MOVE = 2s) : la machine
