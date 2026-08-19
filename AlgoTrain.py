@@ -1534,9 +1534,16 @@ def main() -> None:
     elevation = read_elevation(elevation_path, height, width)
     validate_terrain(ascii_rows, elevation)
 
-    # On utilise l'environnement embarque (squelette) ; remplacable par
-    # AlgoEnv.py quand le moteur concret sera disponible.
-    factory = AlgoGamesEnv
+    # Charge AlgoEnv.py (moteur GDD+Twist reel) s'il est present a cote de ce
+    # script ; sinon on retombe sur l'environnement embarque (squelette).
+    algo_env_path = Path(__file__).resolve().parent / "AlgoEnv.py"
+    if algo_env_path.is_file():
+        external_module = import_module(algo_env_path, "algogames_env")
+        factory = find_factory(external_module)
+        print(f"[train] moteur externe charge depuis {algo_env_path.name} -> {factory.__name__}")
+    else:
+        factory = AlgoGamesEnv
+        print("[train] AlgoEnv.py introuvable : utilisation du moteur embarque (squelette).")
 
     random.seed(args.seed)
     np.random.seed(args.seed)

@@ -1,0 +1,254 @@
+"""AlgoEnv.py — Environnement gymnasium reel pour AlgoGames 2 (GDD + Twist).
+
+Encodage 15 canaux IDENTIQUE au contrat documente dans AlgoTrain.AlgoGamesEnv
+(meme mapping de tuiles, memes formules de normalisation d'elevation), mais
+anime par GameEngine.py : vraies regles (F/M/X/G, hop/climb, push+Twist,
+hacking, autopilote machines, look-ahead collisions) au lieu du squelette.
+
+Charge dynamiquement par AlgoTrain.main() via find_factory() -> make_env().
+"""
+from __future__ import annotations
+from pathlib import Path
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+from AlgoTrain import (
+    HEROES, MAX_HEIGHT, MAX_WIDTH, N_GRID_CHANNELS, N_SCALARS, AUGMENTATIONS,
+    LOOKAHEAD_TICKS, action_mask, read_map_header, read_elevation, validate_terrain,
+)
+from GameEngine import GameEngine
+
+_TILE_CHANNELS = {".": 0, "#": 1, "*": 2, "o": 3, "t": 4, "@": 5, "+": 6, "X": 7, "G": 8}
+_HERO_CH, _FACING_CH, _ABS_ELEV_CH, _REL_ELEV_CH, _NEXT_X_CH, _NEXT_G_CH = 9, 10, 11, 12, 13, 14
+
+_STREAK_LIMIT = 5
+_RESOURCE_LOW_TICKS_LIMIT = 10
+_SCORE_BONUS_SCALE = 0.02  # bonus terminal = score officiel GDD * scale
+
+_REWARD_DEFAULTS = dict(
+    stone_collected=25.0, chest_hidden=150.0,
+    strategic_action=0.30, useful_hack=0.75, useful_fill=1.00, useful_cut=1.00,
+    useful_push=0.50, progress_to_objective=0.05,
+    invalid_action=-0.15, idle_action=-0.02, prolonged_block=-1.00,
+    chest_destroyed=-35.0, voluntary_chest_loss=-75.0,
+    resource_exhausted=-5.0, timeout=0.0,
+)
+
+
+def _augment(rows, elevation, mode):
+    m = np.array([list(r) for r in rows])
+    e = elevation
+    if mode == "transpose":
+        m, e = m.T, e.T
+    elif mode == "rotate90":
+        m, e = np.rot90(m), np.rot90(e)
+    elif mode == "rotate180":
+        m, e = np.rot90(m, 2), np.rot90(e, 2)
+    elif mode == "rotate270":
+        m, e = np.rot90(m, 3), np.rot90(e, 3)
+    elif mode == "mirror_horizontal":
+        m, e = np.fliplr(m), np.fliplr(e)
+    elif mode == "mirror_vertical":
+        m, e = np.flipud(m), np.flipud(e)
+    return ["".join(r) for r in m], np.ascontiguousarray(e, dtype=elevation.dtype)
+
+
+class AlgoEnv(gym.Env):
+    """1 instance = 1 hero controle ('F' ou 'M'). L'autre hero est pilote par
+    GameEngine.scripted_action() (heuristique simple, sujette au meme
+    look-ahead de collisions que tout le reste)."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, map_path, elevation_path, hero="F", augmentation="identity",
+                 augmentations=AUGMENTATIONS, engine_config=None, reward_config=None,
+                 seed=0, max_height=MAX_HEIGHT, max_width=MAX_WIDTH,
+                 grid_channels=N_GRID_CHANNELS, scalar_count=N_SCALARS):
+        super().__init__()
+        if hero not in HEROES:
+            raise ValueError(f"hero inconnu : {hero!r}. Attendu : {list(HEROES)}.")
+        self.hero = hero
+        self.other = "M" if hero == "F" else "F"
+        self.action_names = HEROES[hero]["actions"]
+        self.n_actions = len(self.action_names)
+        self.engine_config = dict(engine_config or {})
+        self.reward_config = {**_REWARD_DEFAULTS, **(reward_config or {})}
+        self.grid_channels, self.scalar_count = grid_channels, scalar_count
+
+        self.map_path, self.elevation_path = Path(map_path), Path(elevation_path)
+        h, w, self.max_time, base_rows = read_map_header(self.map_path)
+        base_elev = read_elevation(self.elevation_path, h, w)
+        validate_terrain(base_rows, base_elev)
+        mode = augmentation if augmentation in augmentations else "identity"
+        self.ascii_rows, self.elevation = _augment(base_rows, base_elev, mode)
+        self.height, self.width = len(self.ascii_rows), len(self.ascii_rows[0])
+
+        self.observation_space = spaces.Dict({
+            "grid": spaces.Box(-1.0, 1.0, (grid_channels, MAX_HEIGHT, MAX_WIDTH), np.float32),
+            "scalars": spaces.Box(0.0, 1.0, (scalar_count,), np.float32),
+        })
+        self.action_space = spaces.Discrete(self.n_actions)
+
+        self._np_rng = np.random.default_rng(seed)
+        self.engine: GameEngine | None = None
+        self._invalid_streak = 0
+        self._prev_dist = 0
+
+    # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
+    def _build_grid(self):
+        g = np.zeros((self.grid_channels, MAX_HEIGHT, MAX_WIDTH), dtype=np.float32)
+        e = self.engine
+        for y in range(e.H):
+            row = e.terrain[y]
+            for x in range(e.W):
+                ch = _TILE_CHANNELS.get(row[x])
+                if ch is not None:
+                    g[ch, y, x] = 1.0
+        for cx, cy in e.chests:
+            g[_TILE_CHANNELS["*"], cy, cx] = 1.0
+        for sx, sy in e.stones:
+            g[_TILE_CHANNELS["+"], sy, sx] = 1.0
+        for m in e.machines:
+            g[_TILE_CHANNELS[m["type"]], m["y"], m["x"]] = 1.0
+
+        hx, hy = e.pos[self.hero]
+        g[_HERO_CH, hy, hx] = 1.0
+        fdx, fdy = e.facing[self.hero]
+        fx, fy = hx + fdx, hy + fdy
+        facing_in_bounds = e.in_bounds(fx, fy)
+        if facing_in_bounds:
+            g[_FACING_CH, fy, fx] = 1.0
+
+        elev = self.elevation.astype(np.float32)
+        g[_ABS_ELEV_CH, :e.H, :e.W] = (elev / 4.5) - 1.0
+        mean_elev = float(elev.mean())
+        g[_REL_ELEV_CH, :e.H, :e.W] = np.clip((elev - mean_elev) / 4.5, -1.0, 1.0)
+
+        if self.engine_config.get("look_ahead", True):
+            only_if_chest = self.engine_config.get("lookahead_only_if_chest_ahead", True)
+            chest_ahead = facing_in_bounds and e.chest_at(fx, fy) is not None
+            if chest_ahead or not only_if_chest:
+                preview = e.preview_machine_positions(LOOKAHEAD_TICKS)
+                for px, py in preview["X"]:
+                    g[_NEXT_X_CH, py, px] = 1.0
+                for px, py in preview["G"]:
+                    g[_NEXT_G_CH, py, px] = 1.0
+        return g
+
+    def _build_scalars(self):
+        e = self.engine
+        s = np.zeros((self.scalar_count,), dtype=np.float32)
+        hx, hy = e.pos[self.hero]
+        s[0] = np.clip(e.stamina[self.hero] / 100.0, 0.0, 1.0)
+        s[1] = np.clip(e.battery[self.hero] / 100.0, 0.0, 1.0)
+        s[2] = np.clip((e.max_time - e.tick) / e.max_time, 0.0, 1.0) if e.max_time > 0 else 0.0
+        s[3] = np.clip(hx / max(1, e.W - 1), 0.0, 1.0)
+        s[4] = np.clip(hy / max(1, e.H - 1), 0.0, 1.0)
+        s[5] = 1.0 if e.on_engine[self.hero] is not None else 0.0
+        return s
+
+    def _obs(self):
+        return {"grid": self._build_grid(), "scalars": self._build_scalars()}
+
+    def _info(self):
+        e = self.engine
+        return {
+            "is_on_engine": e.on_engine[self.hero] is not None,
+            "hero_pos": e.pos[self.hero],
+            "hero_stamina": e.stamina[self.hero],
+            "hero_battery": e.battery[self.hero],
+            "stones_collected": e.stones_collected,
+            "chests_hidden": e.chests_hidden,
+            "chests_destroyed": e.chests_destroyed,
+        }
+
+    def _nearest_objective_dist(self):
+        e = self.engine
+        hx, hy = e.pos[self.hero]
+        targets = list(e.stones) + [(c[0], c[1]) for c in e.chests]
+        if not targets:
+            return 0
+        return min(abs(tx - hx) + abs(ty - hy) for tx, ty in targets)
+
+    # ---- gym API ------------------------------------------------------------
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self._np_rng = np.random.default_rng(seed)
+        self.engine = GameEngine(
+            self.ascii_rows, self.elevation, self.max_time,
+            engine_config=self.engine_config,
+            seed=int(self._np_rng.integers(0, 2**31 - 1)),
+        )
+        self._invalid_streak = 0
+        self._prev_dist = self._nearest_objective_dist()
+        return self._obs(), self._info()
+
+    def step(self, action):
+        e = self.engine
+        a_name = self.action_names[int(action)]
+        other_action = e.scripted_action(self.other)
+        # GameEngine invalide deja nativement toute action hors du contrat
+        # action_mask() (OFF_ENGINE_ACTIONS vs HACK_*), pas besoin de le
+        # revalider ici.
+        ev = e.step({self.hero: a_name, self.other: other_action})
+        reward = self._reward(ev[self.hero], ev[self.other])
+
+        resource_low = e.resource_low_ticks[self.hero] >= _RESOURCE_LOW_TICKS_LIMIT
+        cleared = not e.stones and not e.chests
+        timeout = e.tick >= e.max_time
+        terminated = bool(resource_low or cleared)
+        truncated = bool(timeout and not terminated)
+
+        info = self._info()
+        if resource_low:
+            info["resources_exhausted"] = True
+            reward += self.reward_config["resource_exhausted"]
+        if terminated or truncated:
+            if truncated:
+                reward += self.reward_config.get("timeout", 0.0)
+            reward += e.official_score() * _SCORE_BONUS_SCALE
+
+        return self._obs(), float(reward), terminated, truncated, info
+
+    def _reward(self, my, other_ev):
+        rc = self.reward_config
+        if not my["valid"]:
+            r = rc["invalid_action"]
+            self._invalid_streak += 1
+            if self._invalid_streak >= _STREAK_LIMIT:
+                r += rc["prolonged_block"]
+            return r
+        self._invalid_streak = 0
+        r = 0.0
+        kind = my["kind"]
+        if kind == "wait":
+            if self.engine.stamina[self.hero] >= 100.0:
+                r += rc["idle_action"]
+        elif kind == "hack":
+            r += rc["useful_hack"]
+        elif kind in ("hack_move_queued", "hack_cw", "hack_ccw"):
+            r += rc["strategic_action"]
+        elif kind == "fill":
+            r += rc["useful_fill"]
+        elif kind == "cut":
+            r += rc["useful_cut"]
+        elif kind == "chest_pushed":
+            r += rc["useful_push"]
+        elif kind == "chest_hidden":
+            r += rc["chest_hidden"]
+        elif kind in ("chest_hole", "chest_cliff"):
+            r += rc["voluntary_chest_loss"]
+        if my.get("stone"):
+            r += rc["stone_collected"]
+        if other_ev["kind"] in ("chest_hole", "chest_cliff"):
+            r += rc["chest_destroyed"]
+        dist = self._nearest_objective_dist()
+        r += rc["progress_to_objective"] * max(-1, min(1, self._prev_dist - dist))
+        self._prev_dist = dist
+        return r
+
+
+def make_env(**kwargs) -> AlgoEnv:
+    return AlgoEnv(**kwargs)
