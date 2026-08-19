@@ -532,11 +532,16 @@ class GameEngine:
                             del self.chests[cidx]; self.chests_hidden += 1
                         else:
                             self.chests[cidx][0], self.chests[cidx][1] = bx, by
-                m["steps"] += 1
-                if m["type"] == 'X' and m["steps"] >= self.cfg["machine_dig_every"]:
-                    if self.terrain[ny][nx] != '#':
-                        self.terrain[ny][nx] = 'o'
-                    m["steps"] = 0
+                if m["hacked_by"] is None:
+                    # Le creusage automatique tous les 5 pas est un
+                    # comportement d'autopilote (cf. docstring en tete de
+                    # fichier) : quand un hero hacke la machine (HACK_MOVE),
+                    # le compteur est mis en pause et ne creuse plus.
+                    m["steps"] += 1
+                    if m["type"] == 'X' and m["steps"] >= self.cfg["machine_dig_every"]:
+                        if self.terrain[ny][nx] != '#':
+                            self.terrain[ny][nx] = 'o'
+                        m["steps"] = 0
                 if rider:
                     self.pos[rider] = (nx, ny)
                     self.hero_move_pending[rider] = False

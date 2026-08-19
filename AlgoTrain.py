@@ -94,6 +94,18 @@ N_SCALARS = 6
 LOOKAHEAD_TICKS = 2  # doir matcher TwistConfig.LookaheadTicks côté C#
 
 ASCII_TILES = frozenset(".#to*+@FMXG")
+
+# Dossier dedie, partage entre Optuna.py (ecriture) et AlgoTrain.py (lecture)
+# pour les hyperparametres trouves par Optuna. Un fichier par hero pour
+# pouvoir lancer F et M en parallele sans collision.
+HYPERPARAMS_DIR = Path("OptunaParams")
+
+
+def hyperparams_path(hero: str) -> Path:
+    HYPERPARAMS_DIR.mkdir(parents=True, exist_ok=True)
+    return HYPERPARAMS_DIR / f"best_hyperparams_{hero}.json"
+
+
 AUGMENTATIONS = (
     "identity",
     "transpose",
@@ -1615,7 +1627,7 @@ def main() -> None:
             device=args.device,
         )
     else:
-        best_params_path = Path("best_hyperparams.json")
+        best_params_path = hyperparams_path(hero)
         best_params: dict[str, Any] = {}
         if best_params_path.exists():
             with best_params_path.open("r", encoding="utf-8") as f:
