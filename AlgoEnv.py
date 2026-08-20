@@ -174,6 +174,15 @@ class AlgoEnv(gym.Env):
         h, w, self.max_time, base_rows = read_map_header(self.map_path)
         base_elev = read_elevation(self.elevation_path, h, w)
         validate_terrain(base_rows, base_elev)
+        # Carte de base non-augmentee, conservee pour re-tirer l'augmentation
+        # a CHAQUE reset() (cf. diagnostic Cause 3 : figer l'augmentation une
+        # seule fois a la creation de l'env biaise tout l'entrainement vers
+        # une seule orientation, potentiellement differente de celle utilisee
+        # a l'evaluation Optuna qui, elle, force toujours "identity").
+        self._base_rows, self._base_elev = base_rows, base_elev
+        self.augmentation_mode = augmentation
+        self.augmentations = augmentations
+        self._aug_cycle = -1
         mode = augmentation if augmentation in augmentations else "identity"
         self.ascii_rows, self.elevation = _augment(base_rows, base_elev, mode)
         self.height, self.width = len(self.ascii_rows), len(self.ascii_rows[0])
@@ -189,6 +198,9 @@ class AlgoEnv(gym.Env):
         self._invalid_streak = 0
         self._idle_streak = 0
         self._prev_dist = 0
+        self._ep_len = 0
+        self._ep_wait = 0
+        self._ep_invalid = 0
 
     # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
     def _build_grid(self):
@@ -202,6 +214,7 @@ class AlgoEnv(gym.Env):
 
     def _info(self):
         e = self.engine
+        ep_len = max(1, self._ep_len)
         return {
             "is_on_engine": e.on_engine[self.hero] is not None,
             "hero_pos": e.pos[self.hero],
@@ -210,7 +223,22 @@ class AlgoEnv(gym.Env):
             "stones_collected": e.stones_collected,
             "chests_hidden": e.chests_hidden,
             "chests_destroyed": e.chests_destroyed,
+            # Masque precis (cf. GameEngine.legal_action_mask) : lu en priorite
+            # par ActionMasker._mask_from_info(), remplace le fallback grossier
+            # base uniquement sur is_on_engine.
+            "action_mask": e.legal_action_mask(self.hero, self.action_names),
+            "wait_ratio": self._ep_wait / ep_len,
+            "invalid_ratio": self._ep_invalid / ep_len,
         }
+
+    def _pick_augmentation(self) -> str:
+        mode = self.augmentation_mode
+        if mode == "random":
+            return str(self._np_rng.choice(self.augmentations))
+        if mode == "all":
+            self._aug_cycle = (self._aug_cycle + 1) % len(self.augmentations)
+            return self.augmentations[self._aug_cycle]
+        return mode if mode in self.augmentations else "identity"
 
     def _nearest_objective_dist(self):
         e = self.engine
@@ -225,6 +253,9 @@ class AlgoEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self._np_rng = np.random.default_rng(seed)
+        mode = self._pick_augmentation()
+        self.ascii_rows, self.elevation = _augment(self._base_rows, self._base_elev, mode)
+        self.height, self.width = len(self.ascii_rows), len(self.ascii_rows[0])
         self.engine = GameEngine(
             self.ascii_rows, self.elevation, self.max_time,
             engine_config=self.engine_config,
@@ -233,6 +264,9 @@ class AlgoEnv(gym.Env):
         self._invalid_streak = 0
         self._idle_streak = 0
         self._prev_dist = self._nearest_objective_dist()
+        self._ep_len = 0
+        self._ep_wait = 0
+        self._ep_invalid = 0
         return self._obs(), self._info()
 
     def step(self, action):
@@ -244,6 +278,12 @@ class AlgoEnv(gym.Env):
         # revalider ici.
         ev = e.step({self.hero: a_name, self.other: other_action})
         reward = self._reward(ev[self.hero], ev[self.other])
+
+        self._ep_len += 1
+        if not ev[self.hero]["valid"]:
+            self._ep_invalid += 1
+        elif ev[self.hero]["kind"] == "wait":
+            self._ep_wait += 1
 
         resource_low = e.resource_low_ticks[self.hero] >= _RESOURCE_LOW_TICKS_LIMIT
         cleared = not e.stones and not e.chests

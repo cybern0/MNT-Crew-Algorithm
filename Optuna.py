@@ -129,25 +129,47 @@ def build_objective(args: argparse.Namespace, factory, map_path: Path, elevation
                 "identity", args.seed + 100_000, 1,
             )
             try:
-                rewards = []
+                # cf. diagnostic Cause 4 : sum(rewards)/len(rewards) seul est
+                # degenere (80% des essais tombent sur le meme score car la
+                # politique WAIT-permanente est deterministe et son retour est
+                # quasi constant). On distingue explicitement un essai qui
+                # n'accomplit rien d'un essai qui progresse, meme si leurs
+                # rewards moyens se ressemblent.
+                rewards, chests, stones, wait_ratios, invalid_ratios = [], [], [], [], []
                 for _ in range(args.n_eval_episodes):
                     obs = eval_env.reset()
-                    done, total_r = False, 0.0
+                    done, total_r, last_info = False, 0.0, {}
                     while not done:
                         action_masks = get_action_masks(eval_env)        # MIGRATION MASKABLEPPO
                         action, _ = model.predict(
                             obs, deterministic=True, action_masks=action_masks,
                         )
-                        obs, r, dones, _ = eval_env.step(action)
+                        obs, r, dones, infos = eval_env.step(action)
                         total_r += float(r[0])
                         done = bool(dones[0])
+                        last_info = infos[0]
                     rewards.append(total_r)
+                    chests.append(last_info.get("chests_hidden", 0))
+                    stones.append(last_info.get("stones_collected", 0))
+                    wait_ratios.append(last_info.get("wait_ratio", 0.0))
+                    invalid_ratios.append(last_info.get("invalid_ratio", 0.0))
             finally:
                 eval_env.close()
         finally:
             train_env.close()
 
-        return sum(rewards) / len(rewards)
+        n = len(rewards)
+        score = (
+            150.0 * (sum(chests) / n)
+            + 25.0 * (sum(stones) / n)
+            - 2.0 * (sum(wait_ratios) / n)
+            - 5.0 * (sum(invalid_ratios) / n)
+            + sum(rewards) / n
+        )
+        trial.set_user_attr("mean_reward", sum(rewards) / n)
+        trial.set_user_attr("mean_chests_hidden", sum(chests) / n)
+        trial.set_user_attr("mean_stones_collected", sum(stones) / n)
+        return score
 
     return objective
 

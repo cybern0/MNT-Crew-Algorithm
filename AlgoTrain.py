@@ -235,14 +235,20 @@ class GridScalarExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim: int = 128):
         super().__init__(observation_space, features_dim)
 
+        # cf. diagnostic Cause 2 : AdaptiveAvgPool2d((1,1)) ecrasait chaque
+        # canal 30x30 en une seule moyenne, detruisant la position relative
+        # des objectifs (coffre a gauche/droite du hero, etc.) -> aliasing
+        # observationnel ou WAIT devient la meilleure action "moyenne"
+        # observable. On conserve desormais une grille spatiale 5x5.
         self.cnn = nn.Sequential(
             nn.Conv2d(N_GRID_CHANNELS, 32, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(2),
             nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.AdaptiveAvgPool2d((5, 5)),
             nn.Flatten(),
         )
 
@@ -254,7 +260,7 @@ class GridScalarExtractor(BaseFeaturesExtractor):
         )
 
         self.combined = nn.Sequential(
-            nn.Linear(64 + 32, features_dim),
+            nn.Linear(64 * 5 * 5 + 32, features_dim),
             nn.ReLU(),
         )
 
@@ -1491,6 +1497,12 @@ class MapLoggerCallback(BaseCallback):
 
 
 def choose_augmentation(mode: str, rank: int) -> str:
+    """Conserve pour compatibilite mais N'EST PLUS appele par make_single_env
+    (cf. diagnostic Cause 3) : resoudre "random"/"all" une seule fois ici,
+    a la creation de l'env, figeait la meme augmentation pour tout
+    l'entrainement -> desaccord possible avec l'evaluation Optuna, qui elle
+    force toujours "identity". AlgoEnv.reset() retire desormais une nouvelle
+    augmentation a CHAQUE episode via AlgoEnv._pick_augmentation()."""
     if mode == "all":
         return AUGMENTATIONS[rank % len(AUGMENTATIONS)]
     if mode == "random":
@@ -1512,7 +1524,9 @@ def make_single_env(
             "map_path": str(map_path),
             "elevation_path": str(elevation_path),
             "hero": hero,
-            "augmentation": choose_augmentation(augmentation, rank),
+            # Mode brut ("identity"/"random"/"all"/nom fixe), non resolu ici :
+            # AlgoEnv retire une augmentation a chaque reset() (Cause 3).
+            "augmentation": augmentation,
             "augmentations": AUGMENTATIONS,
             "engine_config": dict(DEFAULT_ENGINE_CONFIG),
             "reward_config": dict(DEFAULT_REWARD_CONFIG),

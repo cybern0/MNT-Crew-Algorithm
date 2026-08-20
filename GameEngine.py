@@ -14,6 +14,7 @@ pousseurs) entre tous les movers d'un meme tick.
 """
 from __future__ import annotations
 import random
+import numpy as np
 
 DIR = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
 PUSH_DIR = {"PUSH_UP": (0, -1), "PUSH_DOWN": (0, 1), "PUSH_LEFT": (-1, 0), "PUSH_RIGHT": (1, 0)}
@@ -102,6 +103,66 @@ class GameEngine:
         b = self.battery["F"] + self.battery["M"]
         t = max(0, self.max_time - self.tick)
         return self.chests_hidden * 150 + self.stones_collected * 25 + (s + b) // 4 + t // 2
+
+    # ---- masque d'actions legales (cf. diagnostic "politique degeneree WAIT") --
+    # L'ancien masque (is_on_engine seul) laisse passer des MOVE/PUSH/HACK
+    # physiquement impossibles ; WAIT devient alors la seule action "sure"
+    # du point de vue de l'agent et l'entrainement s'effondre dessus. Chaque
+    # condition ci-dessous est un miroir exact de celle utilisee par step().
+    def legal_action_mask(self, hero: str, action_names: list[str]) -> np.ndarray:
+        mask = np.zeros(len(action_names), dtype=bool)
+        riding = self.on_engine[hero] is not None
+
+        if riding and self.hero_move_pending[hero]:
+            # Tick d'execution du HACK_MOVE precedent : le hero est force en
+            # attente quelle que soit l'action fournie (cf. step()).
+            if "WAIT" in action_names:
+                mask[action_names.index("WAIT")] = True
+            return mask
+
+        m = self.machines[self.on_engine[hero]] if riding else None
+        for i, name in enumerate(action_names):
+            if riding:
+                if name == "WAIT":
+                    mask[i] = True
+                elif name in ("HACK_MOVE", "HACK_CW", "HACK_CCW"):
+                    mask[i] = self.battery[hero] >= self.cfg["hack_battery_cost"]
+                elif name == "HACK_FILL" and hero == "F":
+                    dx, dy = m["facing"]
+                    fx, fy = m["x"] + dx, m["y"] + dy
+                    mask[i] = (
+                        self.battery[hero] >= self.cfg["hack_battery_cost"]
+                        and self.in_bounds(fx, fy)
+                        and self.terrain[fy][fx] == "o"
+                    )
+                continue
+
+            if name == "WAIT":
+                mask[i] = True
+            elif name in DIR:
+                dx, dy = DIR[name]
+                tgt = self._hero_target(hero, dx, dy)
+                if tgt is not None:
+                    lx, ly, hop = tgt
+                    cost = self._move_cost(hero, *self.pos[hero], lx, ly, hop)
+                    mask[i] = self.stamina[hero] >= cost
+            elif name in PUSH_DIR:
+                dx, dy = PUSH_DIR[name]
+                mask[i] = self._try_push(hero, dx, dy) is not None
+            elif name == "HACK":
+                target_type = "X" if hero == "F" else "G"
+                x, y = self.pos[hero]
+                idx = self.machine_at(x, y)
+                mask[i] = (
+                    idx is not None
+                    and self.machines[idx]["type"] == target_type
+                    and self.machines[idx]["hacked_by"] is None
+                    and self.battery[hero] >= self.cfg["hack_battery_cost"]
+                )
+
+        if not mask.any():
+            mask[action_names.index("WAIT")] = True
+        return mask
 
     def _elev_blocked(self, kind, x0, y0, x1, y1):
         d = self.elev(x1, y1) - self.elev(x0, y0)
