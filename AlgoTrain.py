@@ -303,6 +303,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--ent-coef-end", type=float, default=None,
+        help="Active un 'temperature schedule' sur l'entropie PPO : --ent-coef sert de valeur de "
+             "DEPART (haute = actions plus variees/exploration en debut d'entrainement) et decroit "
+             "LINEAIREMENT vers --ent-coef-end au fil de --timesteps (politique plus tranchee en "
+             "fin d'entrainement, comme un recuit/annealing de temperature). Non fourni (defaut) : "
+             "ent_coef reste constant a --ent-coef pendant tout l'entrainement (comportement actuel "
+             "inchange). Exemple pour plus de variete au debut : --ent-coef 0.05 --ent-coef-end 0.005",
+    )
     parser.add_argument("--eval-freq", type=int, default=25_000)
     parser.add_argument("--checkpoint-freq", type=int, default=50_000)
     parser.add_argument("--resume", help="Modele .zip a reprendre.")
@@ -1293,6 +1302,42 @@ class AlgoGamesEnv(gym.Env):
         )
 
 
+class EntropyAnnealCallback(BaseCallback):
+    """Fait varier `model.ent_coef` (coefficient d'entropie PPO) au fil de
+    l'entrainement, comme un veritable 'temperature schedule' :
+
+        ent_coef_start -> ent_coef_end (interpolation lineaire sur total_timesteps)
+
+    Contrairement a un simple flag statique, ceci a un effet direct et
+    continu sur l'entrainement : PPO relit `self.ent_coef` a chaque appel de
+    `train()` pour ponderer le terme d'entropie de la loss, donc modifier cet
+    attribut entre deux rollouts change reellement la pression exercee sur la
+    politique vers des actions plus variees (ent_coef eleve) ou plus
+    tranchees/deterministes (ent_coef faible).
+
+    Usage typique : ent_coef_start eleve (ex 0.05) pour garder une politique
+    variee/exploratoire en debut d'entrainement (evite l'effondrement precoce
+    vers un WAIT-loop degenere), puis decroissance vers une valeur faible
+    (ex 0.005) pour laisser la politique se stabiliser et devenir decisive en
+    fin d'entrainement.
+    """
+
+    def __init__(self, ent_coef_start: float, ent_coef_end: float, total_timesteps: int, hero: str = ""):
+        super().__init__()
+        self.ent_coef_start = ent_coef_start
+        self.ent_coef_end = ent_coef_end
+        self.total_timesteps = max(int(total_timesteps), 1)
+        self.hero = hero
+
+    def _on_step(self) -> bool:
+        progress = min(self.num_timesteps / self.total_timesteps, 1.0)
+        current = self.ent_coef_start + (self.ent_coef_end - self.ent_coef_start) * progress
+        self.model.ent_coef = current
+        prefix = f"{self.hero}/" if self.hero else ""
+        self.logger.record(f"{prefix}ent_coef_current", current)
+        return True
+
+
 class EpisodeStatsCallback(BaseCallback):
     """Journalise par hero : episodes, actions invalides, hacks utiles, etc.
 
@@ -1725,6 +1770,26 @@ def main() -> None:
             log_every=args.log_episodes,
         ),
     ]
+
+    if args.ent_coef_end is not None:
+        # Le point de depart effectif est celui reellement utilise pour construire
+        # le modele : soit --ent-coef, soit la valeur trouvee par Optuna si
+        # best_hyperparams_{hero}.json existe et contient "ent_coef" (voir
+        # model_kwargs.update(best_params) plus haut, qui peut deja l'avoir
+        # surchargee).
+        effective_start = best_params.get("ent_coef", args.ent_coef) if not args.resume else args.ent_coef
+        print(
+            f"[train] ent_coef schedule active : {effective_start} -> {args.ent_coef_end} "
+            f"sur {args.timesteps} timesteps."
+        )
+        callbacks.append(
+            EntropyAnnealCallback(
+                ent_coef_start=effective_start,
+                ent_coef_end=args.ent_coef_end,
+                total_timesteps=args.timesteps,
+                hero=hero,
+            )
+        )
 
     if args.checkpoint_freq > 0:
         callbacks.append(
