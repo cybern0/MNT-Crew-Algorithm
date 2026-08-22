@@ -89,101 +89,113 @@ def _carve_path(rows: list[str], a, b) -> list[str]:
 
 
 def _enforce_twist_constraints(rows: list[str], elevation: np.ndarray) -> None:
-    """Ajuste localement les élévations pour respecter :
-
-      - 'o' / 't' : |elev - voisin| <= 5 (règle du Twist)
-      - '#' : elev 0 ; autres : elev dans [1, 9]
-
-    Modifie `elevation` en place. L'algorithme :
-
-      1. On clip d'abord 0 pour '#', [1,9] pour le reste.
-      2. Pour chaque 'o'/'t', on tire son élévation vers le voisin (mid-point).
-         On boucle jusqu'à convergence ou jusqu'à max_passes (50) — c'est
-         largement suffisant pour une grille 15x20.
-      3. Si après convergence un 'o'/'t' reste en violation (cas où son
-         voisin est lui-même un 'o'/'t' contraint par un autre voisin très
-         haut), on tente de pousser le VOISIN non-'o'/'t' d'un cran vers
-         la valeur du 'o'/'t' (cela peut casser légèrement la pente
-         générale mais évite une carte injouable).
-
-    L'approche converge parce que les 'o'/'t' sont peu nombreux et que les
-    déplacements d'élévation sont bornés ([1,9]).
+    """Assure une carte de terrain lisse et jouable : les cases traversables
+    ne doivent pas présenter de saut d'élévation excessif, et les cases 'o'/'t'
+    restent dans la règle Twist. On corrige le terrain de manière globale, pas
+    seulement sur les trous/arbres, parce que des pentes brutales 1↔9 rendent
+    la map quasi injouable pour les héros.
     """
     h, w = elevation.shape
-    # 1. Clipping initial : '#' -> 0, autres -> [1, 9].
-    for y in range(h):
-        for x in range(w):
-            if rows[y][x] == ROCK:
-                elevation[y, x] = 0
-            else:
-                v = int(elevation[y, x])
-                if v < 1:
-                    elevation[y, x] = 1
-                elif v > 9:
-                    elevation[y, x] = 9
-
-    # 2. Tirer chaque 'o'/'t' vers le midpoint avec le voisin le plus extrême.
-    # On boucle jusqu'à ce qu'aucun 'o'/'t' ne change pendant une passe complète.
-    MAX_PASSES = 50
-    for _ in range(MAX_PASSES):
+    for _ in range(50):
         changed = False
         for y in range(h):
             for x in range(w):
-                tile = rows[y][x]
-                if tile not in {"o", "t"}:
+                if rows[y][x] == ROCK:
+                    elevation[y, x] = 0
+                    continue
+                v = int(elevation[y, x])
+                if v < 1:
+                    elevation[y, x] = 1
+                    changed = True
+                elif v > 9:
+                    elevation[y, x] = 9
+                    changed = True
+
+                for nx, ny in _neighbors(x, y, w, h):
+                    if rows[ny][nx] == ROCK:
+                        continue
+                    nv = int(elevation[ny, nx])
+                    diff = abs(v - nv)
+                    if diff > 5:
+                        if v < nv:
+                            elevation[y, x] = max(1, min(9, nv - 5))
+                        else:
+                            elevation[y, x] = max(1, min(9, nv + 5))
+                        changed = True
+                        v = int(elevation[y, x])
+        if not changed:
+            break
+
+    # Phase de sécurisation : si un 'o'/'t' ou une case traversable reste en
+    # contradiction locale, on pousse le voisin vers la valeur moyenne.
+    for _ in range(25):
+        changed = False
+        for y in range(h):
+            for x in range(w):
+                if rows[y][x] == ROCK:
                     continue
                 cur = int(elevation[y, x])
-                # Trouver le voisin > 0 le plus éloigné en valeur absolue.
-                worst_diff = 0
-                worst_neighbor = cur
                 for nx, ny in _neighbors(x, y, w, h):
-                    neighbor = int(elevation[ny, nx])
-                    if neighbor <= 0:
+                    if rows[ny][nx] == ROCK:
                         continue
-                    diff = abs(cur - neighbor)
-                    if diff > worst_diff:
-                        worst_diff = diff
-                        worst_neighbor = neighbor
-                if worst_diff > 5:
-                    # Tirer vers le voisin sans casser [1, 9].
-                    # On se place à ±5 du voisin extrême, dans le sens qui
-                    # rapproche cur de worst_neighbor.
-                    if cur < worst_neighbor:
-                        new_val = worst_neighbor - 5
-                    else:
-                        new_val = worst_neighbor + 5
-                    new_val = max(1, min(9, new_val))
-                    if new_val != cur:
-                        elevation[y, x] = new_val
+                    other = int(elevation[ny, nx])
+                    if abs(cur - other) > 5:
+                        target = (cur + other) // 2
+                        elevation[y, x] = max(1, min(9, target))
+                        elevation[ny, nx] = max(1, min(9, target))
                         changed = True
         if not changed:
             break
 
-    # 3. Filet de sécurité : si un 'o'/'t' reste en violation (cas rare de
-    # contraintes circulaires entre 'o'/'t' voisins), on abaisse le VOISIN
-    # non-'o'/'t' le plus haut pour faire taire la violation. On ne touche
-    # jamais aux rochers (elevation 0) ni aux autres 'o'/'t' (déjà réglés
-    # à l'étape 2).
+
+def _generate_correlated_elevation(rows: list[str], rnd: random.Random) -> np.ndarray:
+    """Génère un terrain lisse et corrélé, avec des pentes locales cohérentes,
+    sans tirage indépendant de chaque case qui produit des montées abruptes.
+    """
+    h, w = len(rows), len(rows[0])
+    elevation = np.zeros((h, w), dtype=np.int8)
+    # Valeur de départ sur une grille grossière pour donner une structure globale
+    # (gradient / plateau) ; on la lisse ensuite par moyenne locale.
+    coarse_h = max(2, h // 3)
+    coarse_w = max(2, w // 3)
+    coarse = np.zeros((coarse_h, coarse_w), dtype=np.float32)
+    for y in range(coarse_h):
+        for x in range(coarse_w):
+            coarse[y, x] = rnd.randint(1, 9)
+
     for y in range(h):
         for x in range(w):
-            tile = rows[y][x]
-            if tile not in {"o", "t"}:
+            if rows[y][x] == ROCK:
                 continue
-            cur = int(elevation[y, x])
+            gx = min(coarse_w - 1, x * coarse_w // w)
+            gy = min(coarse_h - 1, y * coarse_h // h)
+            val = float(coarse[gy, gx])
             for nx, ny in _neighbors(x, y, w, h):
-                neighbor = int(elevation[ny, nx])
-                if neighbor <= 0:
+                if rows[ny][nx] != ROCK:
+                    gx2 = min(coarse_w - 1, nx * coarse_w // w)
+                    gy2 = min(coarse_h - 1, ny * coarse_h // h)
+                    val += float(coarse[gy2, gx2])
+            val /= 5.0
+            elevation[y, x] = int(np.clip(round(val), 1, 9))
+
+    # Lissage local final : chaque case prend la moyenne de son voisinage,
+    # ce qui supprime les pics isolés et garde un modèle de terrain cohérent.
+    for _ in range(12):
+        new = elevation.copy()
+        for y in range(h):
+            for x in range(w):
+                if rows[y][x] == ROCK:
+                    new[y, x] = 0
                     continue
-                if abs(cur - neighbor) > 5:
-                    # Pousser le voisin (non '#' et non 'o'/'t') vers cur.
-                    if rows[ny][nx] in {"o", "t", ROCK}:
-                        continue
-                    if cur < neighbor:
-                        new_neighbor = cur + 5
-                    else:
-                        new_neighbor = cur - 5
-                    new_neighbor = max(1, min(9, new_neighbor))
-                    elevation[ny, nx] = new_neighbor
+                vals = [int(elevation[y, x])]
+                for nx, ny in _neighbors(x, y, w, h):
+                    if rows[ny][nx] != ROCK:
+                        vals.append(int(elevation[ny, nx]))
+                new[y, x] = int(np.clip(round(sum(vals) / len(vals)), 1, 9))
+        elevation = new
+
+    _enforce_twist_constraints(rows, elevation)
+    return elevation
 
 
 def _place_unique(rows: list[str], tile: str, rnd: random.Random,
@@ -292,16 +304,11 @@ def generate_map(
         if not connected(fpos, mpos, rows):
             rows = _carve_path(rows, fpos, mpos)
 
-        # Élévation : 0 pour '#', 1..9 sinon.
-        elevation = np.zeros((height, width), dtype=np.int8)
-        for y in range(height):
-            for x in range(width):
-                if rows[y][x] == ROCK:
-                    elevation[y, x] = 0
-                else:
-                    elevation[y, x] = rnd.randint(1, 9)
-
-        _enforce_twist_constraints(rows, elevation)
+        # Élévation lisse et corrélée dans l'espace : ce n'est pas un tirage
+        # indépendant par case, sinon on obtient des montées abruptes 1↔9 qui
+        # bloquent presque tous les déplacements. Le terrain est ensuite
+        # nettoyé par la contrainte Twist globale.
+        elevation = _generate_correlated_elevation(rows, rnd)
 
         # Vérifications finales (anti-boucle infinie).
         try:
