@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-render", action="store_true",
                          help="N'affiche que la ligne de stats a chaque tick, pas la map ascii.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                         help="0.0 (defaut) = argmax pur (greedy), identique au contrat C#/ONNX actuel. "
+                              ">0.0 = echantillonnage softmax(logits/temperature) parmi les actions "
+                              "valides (masque), pour varier les actions choisies. 1.0 = distribution "
+                              "de la politique telle quelle ; <1 durcit vers le greedy, >1 aplatit "
+                              "davantage. N'affecte QUE ce script de rejeu local : le contrat d'export "
+                              "ONNX (logits bruts) et le runtime C#/GameRunner ne sont pas modifies.")
     parser.add_argument("--selftest", action="store_true",
                          help="Lance test_play_onnx.py (pytest) avant de jouer ; arrete si echec.")
     return parser.parse_args()
@@ -74,9 +81,19 @@ def load_session(path: str, device: str) -> ort.InferenceSession:
 
 
 def pick_action(session: ort.InferenceSession, action_names: list[str],
-                 grid: np.ndarray, scalars: np.ndarray, valid_mask: np.ndarray) -> str:
+                 grid: np.ndarray, scalars: np.ndarray, valid_mask: np.ndarray,
+                 temperature: float = 0.0,
+                 rng: np.random.Generator | None = None) -> str:
     """logits bruts (contrat Exports.py, pas d'argmax cote export) -> argmax
-    masque, equivalent a MaskablePPO.predict(..., action_masks=...)."""
+    masque, equivalent a MaskablePPO.predict(..., action_masks=...).
+
+    temperature=0.0 (defaut) : comportement inchange, argmax pur.
+    temperature>0.0 : echantillonnage softmax(logits/temperature) restreint
+    aux actions valides (meme masque que le mode greedy). Ne change QUE ce
+    script Python local -- le fichier ONNX exporte et le contrat consomme
+    par GameRunner (actions.txt au format GDD) restent identiques : on
+    choisit juste, parmi le meme ensemble d'actions legales, laquelle
+    ecrire dans actions.txt."""
     logits = session.run(
         None,
         {"map": grid[None].astype(np.float32), "stats": scalars[None].astype(np.float32)},
@@ -86,7 +103,21 @@ def pick_action(session: ort.InferenceSession, action_names: list[str],
         # Garde-fou : action_mask() garantit toujours >=1 action valide (WAIT
         # ou HACK_* selon on_engine), ce cas ne devrait jamais arriver.
         return "WAIT" if "WAIT" in action_names else action_names[0]
-    return action_names[int(np.argmax(masked))]
+
+    if temperature <= 0.0:
+        return action_names[int(np.argmax(masked))]
+
+    finite = np.isfinite(masked)
+    scaled = np.where(finite, masked / temperature, -np.inf)
+    scaled = scaled - np.max(scaled[finite])  # stabilite numerique du softmax
+    probs = np.where(finite, np.exp(scaled), 0.0)
+    probs_sum = probs.sum()
+    if probs_sum <= 0.0:
+        return action_names[int(np.argmax(masked))]
+    probs /= probs_sum
+
+    rng = rng or np.random.default_rng()
+    return action_names[int(rng.choice(len(action_names), p=probs))]
 
 
 def render_map(engine: GameEngine) -> str:
@@ -144,6 +175,9 @@ def main() -> int:
 
     sessions = {"F": load_session(args.onnx_f, args.device), "M": load_session(args.onnx_m, args.device)}
     action_names = {h: HEROES[h]["actions"] for h in ("F", "M")}
+    rng = np.random.default_rng(args.seed)
+    if args.temperature > 0.0:
+        print(f"[play] echantillonnage active (temperature={args.temperature}), rejeu non deterministe (seed={args.seed}).")
 
     pairs: list[tuple[str, str]] = []
 
@@ -159,7 +193,10 @@ def main() -> int:
             grid_obs = build_grid(engine, h, elevation, engine_config, N_GRID_CHANNELS)
             scalars_obs = build_scalars(engine, h, N_SCALARS)
             mask = action_mask(engine.on_engine[h] is not None, action_names[h])
-            chosen[h] = pick_action(sessions[h], action_names[h], grid_obs, scalars_obs, mask)
+            chosen[h] = pick_action(
+                sessions[h], action_names[h], grid_obs, scalars_obs, mask,
+                temperature=args.temperature, rng=rng,
+            )
 
         engine.step(chosen)
         tick += 1
