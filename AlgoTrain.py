@@ -1301,10 +1301,8 @@ class AlgoGamesEnv(gym.Env):
                     self._hack_action_count = 0
                     result = "unhack"
                 else:
-                    if self._stamina > 25.0 and self._battery > 25.0:
+                    if self._stamina <= 0.0 or self._battery <= 0.0:
                         reward += float(rc.get("wait_with_full_resources", -0.20))
-                    elif self._stamina > 25.0:
-                        reward += float(rc.get("wait_without_recovery_need", -0.05))
                     else:
                         self._stamina = min(self._MAX_STAMINA, self._stamina + 0.5)
                     result = "wait"
