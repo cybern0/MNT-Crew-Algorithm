@@ -70,6 +70,28 @@ _REWARD_DEFAULTS = {
     # Fin de partie.
     "resource_exhausted": -5.0,
     "timeout": 0.0,
+    # Additional shaping / penalties (expanded strategy)
+    "implicit_wait": -0.20,
+    "blocked_move": -0.15,
+    "insufficient_stamina": -0.10,
+    "wrong_machine_type": -0.25,
+    "hack_when_machine_needed": 0.50,
+    "hack_when_machine_not_needed": -0.25,
+    "rotation_toward_target": 0.20,
+    "rotation_away_from_target": -0.15,
+    "hack_move_progress": 0.35,
+    "hack_move_regress": -0.20,
+    "blocked_hack_move": -0.20,
+    "fill_useful_hole": 2.00,
+    "fill_irrelevant_hole": -0.10,
+    "cut_useful_tree": 2.00,
+    "cut_irrelevant_tree": -0.10,
+    "wasted_battery": -0.25,
+    "resource_score_delta_scale": 0.25,
+    "wait_productive_action_available": -0.20,
+    "machine_stone_recovered": 25.0,
+    "machine_stone_stolen_by_other": 0.0,
+    "objectives_cleared": 20.0,
 }
 
 
@@ -225,10 +247,9 @@ class AlgoEnv(gym.Env):
             "stones_collected": e.stones_collected,
             "chests_hidden": e.chests_hidden,
             "chests_destroyed": e.chests_destroyed,
-            # Masque precis (cf. GameEngine.legal_action_mask) : lu en priorite
-            # par ActionMasker._mask_from_info(), remplace le fallback grossier
-            # base uniquement sur is_on_engine.
-            "action_mask": e.legal_action_mask(self.hero, self.action_names),
+            # Masque structurel (autorise les erreurs physiques qui seront
+            # converties en WAIT par le moteur) : preferer pour l'apprentissage.
+            "action_mask": e.structural_action_mask(self.hero, self.action_names),
             "wait_ratio": self._ep_wait / ep_len,
             "invalid_ratio": self._ep_invalid / ep_len,
         }
@@ -312,6 +333,10 @@ class AlgoEnv(gym.Env):
         self._idle_streak = 0
         self._refresh_objective_distances()
         self._initial_official_score = float(self.engine.official_score())
+        # Track local resource potential for terminal credit assignment
+        self._initial_local_resource_score = self._hero_resource_score()
+        # potential-based shaping
+        self._prev_potential = self._potential()
         self._ep_len = 0
         self._ep_wait = 0
         self._ep_invalid = 0
@@ -348,6 +373,10 @@ class AlgoEnv(gym.Env):
             before_stamina=before_stamina,
             productive_action_available=productive_action_available,
         )
+        # potential shaping (telescoping) to encourage genuine progress
+        current_potential = self._potential()
+        reward += current_potential - self._prev_potential
+        self._prev_potential = current_potential
         self._ep_len += 1
         if not my["valid"]:
             self._ep_invalid += 1
@@ -358,7 +387,11 @@ class AlgoEnv(gym.Env):
         )
         cleared = not e.stones and not e.chests
         timeout = e.tick >= e.max_time
-        terminated = bool(resource_low or cleared)
+        # By default keep running until timeout; early stop on cleared optional
+        early_stop_on_cleared = self.engine_config.get("early_stop_on_cleared", False)
+        terminated = bool(resource_low and self.engine_config.get("resource_exhaustion_first", True))
+        if early_stop_on_cleared and cleared:
+            terminated = True
         truncated = bool(timeout and not terminated)
         info = self._info()
         info["action_name"] = a_name
@@ -373,20 +406,13 @@ class AlgoEnv(gym.Env):
             info["termination_reason"] = "timeout"
             reward += self.reward_config.get("timeout", 0.0)
         if terminated or truncated:
+            # Assign local resource delta to avoid credit assignment to the other hero
+            local_resource_delta = self._hero_resource_score() - self._initial_local_resource_score
+            reward += local_resource_delta
             final_score = float(e.official_score())
             score_delta = final_score - self._initial_official_score
-            # Les pierres et coffres ont deja produit leurs rewards exacts durant
-            # l'episode. Pour eviter le double comptage, le bonus terminal ne
-            # conserve que l'effet ressources + temps non deja redistribue.
-            direct_objective_score = (
-                e.stones_collected * 25.0
-                + e.chests_hidden * 150.0
-            )
-            residual_score_delta = score_delta - direct_objective_score
-            reward += residual_score_delta * _TERMINAL_SCORE_DELTA_SCALE
             info["official_score"] = final_score
             info["official_score_delta"] = score_delta
-            info["terminal_residual_score_delta"] = residual_score_delta
         return self._obs(), float(reward), terminated, truncated, info
 
     def _reward(
@@ -521,6 +547,19 @@ class AlgoEnv(gym.Env):
                 ):
                     reward += rc["regress_chest_from_bush"]
         return reward
+
+    def _hero_resource_score(self) -> float:
+        e = self.engine
+        return 0.25 * (e.stamina[self.hero] + e.battery[self.hero]) + 0.25 * max(0, e.max_time - e.tick)
+
+    def _potential(self) -> float:
+        e = self.engine
+        stone_d = self._nearest_stone_dist()
+        chest_d = self._nearest_chest_dist()
+        stone_term = 0.0 if stone_d is None else -0.20 * stone_d
+        chest_term = 0.0 if chest_d is None else -0.25 * chest_d
+        resource_term = 0.0025 * (e.stamina[self.hero] + e.battery[self.hero])
+        return stone_term + chest_term + resource_term
 
     def _invalid_penalty(self, requested_action: str, result_kind: str) -> float:
         rc = self.reward_config

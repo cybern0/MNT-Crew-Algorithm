@@ -70,6 +70,7 @@ class GameEngine:
                         "move_pending": False,
                         "steps": 0,
                         "stones": 0,
+                        "dig_pending": False,
                     })
                     self.terrain[y][x] = '.'
         self.stamina = {"F": 100.0, "M": 100.0}
@@ -99,6 +100,71 @@ class GameEngine:
             if m["x"] == x and m["y"] == y:
                 return i
         return None
+
+    def _implicit_wait_event(self, reason: str) -> dict:
+        return {
+            "valid": True,
+            "requested_valid": False,
+            "kind": "implicit_wait",
+            "reason": reason,
+        }
+
+    def structural_action_mask(self, hero: str, action_names: list[str]) -> np.ndarray:
+        """Masque structurel : interdit seulement les actions impossibles au niveau
+        de controle (chevauchement), mais permet d'envoyer des actions qui seront
+        physiquement converties en WAIT par le moteur si elles sont bloquees.
+        Ceci expose des erreurs d'execution au modele sans lui retirer la
+        possibilite d'explorer des actions "erreur"."""
+        import numpy as _np
+
+        mask = _np.zeros(len(action_names), dtype=bool)
+        riding = self.on_engine[hero] is not None
+        hack_cost = self.cfg["hack_battery_cost"]
+
+        for i, name in enumerate(action_names):
+            if riding:
+                if name == "WAIT":
+                    mask[i] = True
+                elif name in ("UP", "DOWN", "LEFT", "RIGHT"):
+                    dx, dy = DIR[name]
+                    tgt = self._hero_target(hero, dx, dy)
+                    if tgt is not None:
+                        lx, ly, hop = tgt
+                        cost = self._move_cost(hero, *self.pos[hero], lx, ly, hop)
+                        mask[i] = self.stamina[hero] >= cost
+                elif name in ("HACK_MOVE", "HACK_CW", "HACK_CCW"):
+                    mask[i] = self.battery[hero] >= hack_cost
+                elif name == "HACK_FILL":
+                    # allow F to attempt fill while riding (structure only)
+                    mask[i] = hero == 'F' and self.battery[hero] >= hack_cost
+            else:
+                # off engine: moves, push, wait, hack allowed
+                if name == "WAIT":
+                    mask[i] = True
+                elif name in ("UP", "DOWN", "LEFT", "RIGHT"):
+                    dx, dy = DIR[name]
+                    tgt = self._hero_target(hero, dx, dy)
+                    if tgt is not None:
+                        lx, ly, hop = tgt
+                        cost = self._move_cost(hero, *self.pos[hero], lx, ly, hop)
+                        mask[i] = self.stamina[hero] >= cost
+                elif name in ("PUSH_UP", "PUSH_DOWN", "PUSH_LEFT", "PUSH_RIGHT"):
+                    dx, dy = PUSH_DIR[name]
+                    mask[i] = self._try_push(hero, dx, dy) is not None
+                elif name == "HACK":
+                    x, y = self.pos[hero]
+                    idx = self.machine_at(x, y)
+                    target_type = 'X' if hero == 'F' else 'G'
+                    mask[i] = (
+                        idx is not None
+                        and self.machines[idx]["type"] == target_type
+                        and self.machines[idx]["hacked_by"] is None
+                        and self.battery[hero] >= hack_cost
+                    )
+        # ensure at least WAIT is allowed
+        if not mask.any() and "WAIT" in action_names:
+            mask[action_names.index("WAIT")] = True
+        return mask
 
     def _transfer_machine_stones(self, machine_index: int) -> None:
         machine = self.machines[machine_index]
@@ -415,6 +481,28 @@ class GameEngine:
         for h in ("F", "M"):
             a = actions.get(h, "WAIT")
             riding = self.on_engine[h] is not None
+            # allow a hero who is riding a machine to unhack+move out using a direction
+            if riding and a in DIR:
+                m = self.machines[self.on_engine[h]]
+                dx, dy = DIR[a]
+                self.facing[h] = (dx, dy)
+                tgt = self._hero_target(h, dx, dy)
+                if tgt is None:
+                    ev[h] = self._implicit_wait_event("blocked_exit")
+                    continue
+                lx, ly, hop = tgt
+                cost = self._move_cost(h, *self.pos[h], lx, ly, hop)
+                if self.stamina[h] < cost:
+                    ev[h] = self._implicit_wait_event("insufficient_stamina")
+                    continue
+                idx = self.on_engine[h]
+                self.machines[idx]["hacked_by"] = None
+                self.machines[idx]["move_pending"] = False
+                self.on_engine[h] = None
+                self.hero_move_pending[h] = False
+                intents[("hero", h)] = (lx, ly)
+                ev[h] = {"valid": True, "kind": "unhack_move", "cost": cost}
+                continue
             if riding:
                 m = self.machines[self.on_engine[h]]
                 if self.hero_move_pending[h]:
@@ -439,7 +527,7 @@ class GameEngine:
                     ev[h] = {"valid": True, "kind": "unhack"}
                 elif a in ("HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"):
                     if (a == "HACK_FILL" and h != "F") or self.battery[h] < self.cfg["hack_battery_cost"]:
-                        ev[h] = {"valid": False, "kind": "invalid"}
+                        ev[h] = self._implicit_wait_event("hack_not_allowed")
                         continue
                     if a == "HACK_MOVE":
                         tgt = self._machine_target(m)
@@ -460,18 +548,17 @@ class GameEngine:
                     elif a == "HACK_CCW":
                         m["facing"] = CCW[m["facing"]]
                         ev[h] = {"valid": True, "kind": "hack_ccw"}
-                    else:  # HACK_FILL
-                        dx, dy = m["facing"]
-                        fx, fy = m["x"] + dx, m["y"] + dy
-                        if self.in_bounds(fx, fy) and self.terrain[fy][fx] == 'o':
-                            self.terrain[fy][fx] = '.'
+                    else:  # HACK_FILL -> target the machine's own cell (runner behaviour)
+                        mx, my = m["x"], m["y"]
+                        if self.terrain[my][mx] == 'o':
+                            self.terrain[my][mx] = '.'
                             ev[h] = {"valid": True, "kind": "fill"}
                         else:
-                            ev[h] = {"valid": False, "kind": "invalid"}
+                            ev[h] = self._implicit_wait_event("no_hole_to_fill")
                             continue
                     self.battery[h] = max(0.0, self.battery[h] - self.cfg["hack_battery_cost"])
                 else:
-                    ev[h] = {"valid": False, "kind": "invalid"}
+                    ev[h] = self._implicit_wait_event("invalid_action")
                 continue
 
             if a == "WAIT":
@@ -481,12 +568,12 @@ class GameEngine:
                 self.facing[h] = (dx, dy)
                 tgt = self._hero_target(h, dx, dy)
                 if tgt is None:
-                    ev[h] = {"valid": False, "kind": "invalid"}
+                    ev[h] = self._implicit_wait_event("blocked_move")
                     continue
                 lx, ly, hop = tgt
                 cost = self._move_cost(h, *self.pos[h], lx, ly, hop)
                 if self.stamina[h] < cost:
-                    ev[h] = {"valid": False, "kind": "invalid"}
+                    ev[h] = self._implicit_wait_event("insufficient_stamina")
                     continue
                 intents[("hero", h)] = (lx, ly)
                 ev[h] = {"valid": True, "kind": "move", "cost": cost}
@@ -495,7 +582,7 @@ class GameEngine:
                 self.facing[h] = (dx, dy)
                 plan = self._try_push(h, dx, dy)
                 if plan is None:
-                    ev[h] = {"valid": False, "kind": "invalid"}
+                    ev[h] = self._implicit_wait_event("push_without_chest")
                     continue
                 push_plan[h] = plan
                 intents[("hero", h)] = (plan[1], plan[2])
@@ -514,7 +601,7 @@ class GameEngine:
                 self.battery[h] = max(0.0, self.battery[h] - self.cfg["hack_battery_cost"])
                 ev[h] = {"valid": True, "kind": "hack"}
             else:
-                ev[h] = {"valid": False, "kind": "invalid"}
+                ev[h] = self._implicit_wait_event("invalid_action")
 
         # autopilote des machines non chevauchees
         for i, m in enumerate(self.machines):

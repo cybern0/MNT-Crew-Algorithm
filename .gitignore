@@ -8,7 +8,7 @@ elevation.txt
 __pycache__/
 *.py[cod]
 *.$py.class
-
+*.ps1
 # C extensions
 *.so
 

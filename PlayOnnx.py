@@ -136,6 +136,10 @@ def main() -> int:
     elevation = read_elevation(elevation_path, height, width)
     validate_terrain(ascii_rows, elevation)
     max_ticks = args.max_ticks or max_time
+    # Ensure the output actions file contains at most `max_time` lines
+    # (including the final END_GAME). We therefore play at most max_time-1
+    # action pairs and append END_GAME as the last line.
+    max_action_ticks = max(0, max_ticks - 1)
 
     # Meme engine_config que celui utilise a l'entrainement (AlgoEnv.py via
     # AlgoTrain.make_single_env) : garantit un encodage 15 canaux identique.
@@ -153,12 +157,12 @@ def main() -> int:
     print(f"[tick 0] score={engine.official_score()}")
 
     tick = 0
-    while tick < max_ticks:
+    while tick < max_action_ticks:
         chosen: dict[str, str] = {}
         for h in ("F", "M"):
             grid_obs = build_grid(engine, h, elevation, engine_config, N_GRID_CHANNELS)
             scalars_obs = build_scalars(engine, h, N_SCALARS)
-            mask = engine.legal_action_mask(h, action_names[h])
+            mask = engine.structural_action_mask(h, action_names[h])
             chosen[h] = pick_action(sessions[h], action_names[h], grid_obs, scalars_obs, mask)
 
         engine.step(chosen)

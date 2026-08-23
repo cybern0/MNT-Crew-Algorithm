@@ -229,6 +229,28 @@ DEFAULT_REWARD_CONFIG = {
     "chest_destroyed": -25.0,
     "voluntary_chest_loss": -50.0,
     "timeout": 0.0,
+    # Expanded reward keys to match AlgoEnv extended defaults
+    "implicit_wait": -0.20,
+    "blocked_move": -0.15,
+    "insufficient_stamina": -0.10,
+    "wrong_machine_type": -0.25,
+    "hack_when_machine_needed": 0.50,
+    "hack_when_machine_not_needed": -0.25,
+    "rotation_toward_target": 0.20,
+    "rotation_away_from_target": -0.15,
+    "hack_move_progress": 0.35,
+    "hack_move_regress": -0.20,
+    "blocked_hack_move": -0.20,
+    "fill_useful_hole": 2.00,
+    "fill_irrelevant_hole": -0.10,
+    "cut_useful_tree": 2.00,
+    "cut_irrelevant_tree": -0.10,
+    "wasted_battery": -0.25,
+    "resource_score_delta_scale": 0.25,
+    "wait_productive_action_available": -0.20,
+    "machine_stone_recovered": 25.0,
+    "machine_stone_stolen_by_other": 0.0,
+    "objectives_cleared": 20.0,
 }
 
 
