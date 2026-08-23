@@ -177,6 +177,17 @@ DEFAULT_ENGINE_CONFIG = {
     "forbid_chest_uphill": True,
     "destroy_chest_drop": 5,
     "resource_exhaustion_first": True,
+    # Compatible GameRunner : le score officiel inclut (map_time_limit - iterCount)/2,
+    # donc terminer des que stones+chests sont cleared augmente directement le score
+    # (moins de ticks consommes = bonus temps plus grand), a condition que actions.txt
+    # se termine par END_GAME (garanti par format_actions_lines()). Voir calcTotalScore()
+    # et runGameLoop() dans GameRunner.java : le runner honore un END_GAME anticipe
+    # sans penalite, il n'exige pas d'atteindre map_time_limit lignes.
+    "early_stop_on_cleared": True,
+    # Meme gamma que PPO (--gamma, defaut 0.995 dans parse_args) pour que le
+    # potential-based shaping soit applique sous sa forme canonique
+    # F(s,a,s') = gamma*Phi(s') - Phi(s) (cf. Ng, Harada & Russell 1999).
+    "reward_gamma": 0.995,
 }
 
 # Les rewards d'apprentissage sont strictement alignes sur les composantes du

@@ -373,9 +373,14 @@ class AlgoEnv(gym.Env):
             before_stamina=before_stamina,
             productive_action_available=productive_action_available,
         )
-        # potential shaping (telescoping) to encourage genuine progress
+        # potential shaping (telescoping) to encourage genuine progress.
+        # Forme canonique F(s,a,s') = gamma*Phi(s') - Phi(s) (Ng, Harada &
+        # Russell 1999) : sans le gamma, un aller-retour ne s'annule plus
+        # exactement des que gamma != 1, ce qui rouvrait (en plus petit) le
+        # meme farm que le bloc distance_reward retire ci-dessous.
+        reward_gamma = float(self.engine_config.get("reward_gamma", 1.0))
         current_potential = self._potential()
-        reward += current_potential - self._prev_potential
+        reward += reward_gamma * current_potential - self._prev_potential
         self._prev_potential = current_potential
         self._ep_len += 1
         if not my["valid"]:
@@ -390,7 +395,8 @@ class AlgoEnv(gym.Env):
         # By default keep running until timeout; early stop on cleared optional
         early_stop_on_cleared = self.engine_config.get("early_stop_on_cleared", False)
         terminated = bool(resource_low and self.engine_config.get("resource_exhaustion_first", True))
-        if early_stop_on_cleared and cleared:
+        objectives_just_cleared = early_stop_on_cleared and cleared and not terminated
+        if objectives_just_cleared:
             terminated = True
         truncated = bool(timeout and not terminated)
         info = self._info()
@@ -402,6 +408,10 @@ class AlgoEnv(gym.Env):
             reward += self.reward_config["resource_exhausted"]
         elif cleared:
             info["termination_reason"] = "objectives_cleared"
+            if objectives_just_cleared:
+                # Bonus declare depuis le debut (_REWARD_DEFAULTS /
+                # DEFAULT_REWARD_CONFIG) mais jamais applique auparavant.
+                reward += self.reward_config.get("objectives_cleared", 0.0)
         elif truncated:
             info["termination_reason"] = "timeout"
             reward += self.reward_config.get("timeout", 0.0)
@@ -506,22 +516,14 @@ class AlgoEnv(gym.Env):
         }
         if battery_spent > 0.0 and kind not in useful_battery_kinds:
             reward += rc["wasted_battery"] * battery_spent
-        current_stone_dist = self._nearest_stone_dist()
-        current_chest_dist = self._nearest_chest_dist()
-        reward += self._distance_reward(
-            self._prev_stone_dist,
-            current_stone_dist,
-            rc["progress_to_stone"],
-            rc["regress_from_stone"],
-        )
-        reward += self._distance_reward(
-            self._prev_chest_dist,
-            current_chest_dist,
-            rc["progress_to_chest"],
-            rc["regress_from_chest"],
-        )
-        self._prev_stone_dist = current_stone_dist
-        self._prev_chest_dist = current_chest_dist
+        # NOTE (fix oscillation UP/DOWN|LEFT/RIGHT) : le shaping pas-a-pas
+        # _distance_reward() etait asymetrique (progress > |regress|), ce qui
+        # rendait un aller-retour net positif meme cumule avec _potential().
+        # _potential() (telescoping, cf. step()) porte deja tout le signal de
+        # rapprochement stone/chest sans ce defaut ; on ne fait plus que
+        # rafraichir le cache de distance pour le reste de la classe.
+        self._prev_stone_dist = self._nearest_stone_dist()
+        self._prev_chest_dist = self._nearest_chest_dist()
         after_chests = {
             (int(cx), int(cy))
             for cx, cy in e.chests
