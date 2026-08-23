@@ -388,11 +388,11 @@ class AlgoEnv(gym.Env):
         reward = 0.0
         kind = my["kind"]
         if kind == "wait":
-            stamina_full = e.stamina[self.hero] >= 100.0
-            battery_full = e.battery[self.hero] >= 100.0
-            if stamina_full and battery_full:
+            stamina_high = e.stamina[self.hero] > 25.0
+            battery_high = e.battery[self.hero] > 25.0
+            if stamina_high and battery_high:
                 reward += rc["wait_with_full_resources"]
-            elif e.stamina[self.hero] >= 95.0:
+            elif stamina_high:
                 reward += rc["wait_without_recovery_need"]
         elif kind == "hack":
             reward += rc["useful_hack"]
