@@ -700,6 +700,7 @@ class GameEngine:
                         ev[rider]["kind"] = "cut"
                 if (nx, ny) in self.stones:
                     self.stones.discard((nx, ny))
+                    m["stones"] = int(m.get("stones", 0)) + 1
                 if ident in machine_push_plan:
                     _, cx, cy, bx, by, bt = machine_push_plan[ident]
                     cidx = self.chest_at(cx, cy)
@@ -727,7 +728,7 @@ class GameEngine:
 
         # regeneration stamina (WAIT hors machine, ou n'importe quelle action pendant qu'on chevauche)
         idle_kinds = {"wait", "unhack", "ride_wait", "hack_cw", "hack_ccw", "fill",
-                      "hack_blocked_rotate", "cut"}
+                  "hack_blocked_rotate", "cut", "implicit_wait"}
         for h in ("F", "M"):
             if ev[h]["kind"] in idle_kinds or self.on_engine[h] is not None:
                 self.regen[h] += 1.0
