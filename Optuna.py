@@ -159,12 +159,15 @@ def build_objective(args: argparse.Namespace, factory, map_path: Path, elevation
             train_env.close()
 
         n = len(rewards)
+        # Le critere Optuna privilegie le retour aligne sur le score officiel.
+        # Les ratios servent uniquement de departage faible : ils ne doivent pas
+        # dominer une pierre ou un coffre effectivement obtenu.
         score = (
-            150.0 * (sum(chests) / n)
-            + 25.0 * (sum(stones) / n)
-            - 2.0 * (sum(wait_ratios) / n)
-            - 5.0 * (sum(invalid_ratios) / n)
-            + sum(rewards) / n
+            sum(rewards) / n
+            + 0.01 * (sum(chests) / n)
+            + 0.001 * (sum(stones) / n)
+            - 0.01 * (sum(wait_ratios) / n)
+            - 0.02 * (sum(invalid_ratios) / n)
         )
         trial.set_user_attr("mean_reward", sum(rewards) / n)
         trial.set_user_attr("mean_chests_hidden", sum(chests) / n)

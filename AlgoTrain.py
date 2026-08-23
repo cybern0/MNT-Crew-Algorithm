@@ -179,47 +179,53 @@ DEFAULT_ENGINE_CONFIG = {
     "resource_exhaustion_first": True,
 }
 
-# IMPORTANT : make_single_env() passe TOUJOURS ce dict explicitement a
-# l'environnement (AlgoEnv/AlgoGamesEnv), donc c'est CE dict-ci qui pilote
-# reellement l'entrainement -- pas _REWARD_DEFAULTS dans AlgoEnv.py (qui
-# n'est qu'un fallback si reward_config=None). Les deux sont maintenus
-# synchronises manuellement ; voir AlgoEnv.py pour le detail du redesign.
+# Les rewards d'apprentissage sont strictement alignes sur les composantes du
+# score officiel :
 #
-# REDESIGN (cf. diagnostic "politique degenere en WAIT permanent" observe
-# apres migration MaskablePPO) :
-#   - progress_to_objective x5 (0.05 -> 0.25) : c'etait le SEUL signal
-#     recompensant un `move` qui ne ramasse pas de pierre -> trop faible
-#     pour justifier le risque de bouger.
-#   - voluntary_chest_loss / chest_destroyed fortement reduits
-#     (-75 -> -20, -35 -> -10) : une maladresse pendant l'exploration
-#     aleatoire du debut ne doit pas a elle seule rendre negative
-#     l'esperance de toute action.
-#   - prolonged_block adouci (-1.00 -> -0.50).
-#   - idle_streak_penalty (nouveau, cf. AlgoEnv._IDLE_STREAK_LIMIT) :
-#     WAIT reste gratuit au debut (recuperation stamina legitime) mais
-#     devient couteux au-dela de 15 ticks consecutifs -> "WAIT partout"
-#     n'est plus l'optimum local le moins risque.
+#   R = C*150 + P*25 + (S+B)//4 + T//2
+#
+# Les gains terminaux exacts ne sont pas redistribues ici. Le shaping sert
+# uniquement a guider l'agent vers une amelioration potentielle du score :
+# rapprochement d'un objectif, conservation des ressources et prevention de
+# la perte d'un coffre.
 DEFAULT_REWARD_CONFIG = {
-    # Objectifs principaux.
+    # Evenements qui augmentent directement le score officiel.
     "stone_collected": 25.0,
     "chest_hidden": 150.0,
-
-    # Etapes strategiques.
-    "strategic_action": 0.30,
-    "useful_hack": 0.75,
-    "useful_fill": 1.00,
-    "useful_cut": 1.00,
-    "useful_push": 0.50,
-    "progress_to_objective": 0.25,
-
-    # Penalites.
-    "invalid_action": -0.15,
-    "idle_action": -0.02,
-    "prolonged_block": -0.50,
-    "idle_streak_penalty": -0.10,
-    "chest_destroyed": -10.0,
-    "voluntary_chest_loss": -20.0,
+    # Progression vers les deux objectifs officiels.
+    "progress_to_stone": 0.30,
+    "regress_from_stone": -0.30,
+    "progress_to_chest": 0.40,
+    "regress_from_chest": -0.40,
+    "progress_chest_to_bush": 0.75,
+    "regress_chest_from_bush": -0.75,
+    # Une action de machine n'est recompensee que si elle rapproche le hero
+    # d'une pierre, d'un coffre, ou ouvre un chemin vers un de ces objectifs.
+    "useful_hack": 0.20,
+    "useful_fill": 0.50,
+    "useful_cut": 0.50,
+    # Preservation des composantes S et B du score final.
+    # Le cout normal de stamina/batterie est deja visible dans le score :
+    # aucune penalite generique supplementaire n'est appliquee aux actions
+    # valides. Seul le gaspillage manifeste est penalise.
+    "wasted_battery": -0.30,
     "resource_exhausted": -5.0,
+    # Actions invalides ou inutiles.
+    "invalid_action": -0.25,
+    "repeated_invalid_action": -0.50,
+    "wait_with_full_resources": -0.20,
+    "wait_without_recovery_need": -0.05,
+    "push_without_chest": -0.35,
+    "blocked_push": -0.25,
+    "hack_without_machine": -0.35,
+    "hack_action_without_riding": -0.35,
+    "useless_hack_rotation": -0.10,
+    "blocked_hack_move": -0.20,
+    # Perte d'un objectif du score.
+    "chest_destroyed": -25.0,
+    "voluntary_chest_loss": -50.0,
+    # Le timeout ne doit pas ajouter une penalite arbitraire : le temps restant
+    # T est deja inclus exactement dans le bonus terminal du score officiel.
     "timeout": 0.0,
 }
 
@@ -811,7 +817,7 @@ class AlgoGamesEnv(gym.Env):
     _DEFAULT_CHEST_DESTROYED_PENALTY = -10.0
     _MAX_BATTERY = 100.0
     _MAX_STAMINA = 100.0
-    _PUSH_STAMINA_COST = 2.0
+    _PUSH_STAMINA_COST = 5.0
     _MOVE_STAMINA_COST = 1.0
     _UPHILL_STAMINA_COST = 3.0
 
@@ -945,6 +951,7 @@ class AlgoGamesEnv(gym.Env):
         self._stones_collected = 0
         self._chests_hidden = 0
         self._chests_destroyed = 0
+        self._invalid_streak = 0
 
         # Positions dynamiques des coffres (set de (x,y)) - peut evoluer.
         self._chest_positions: set[tuple[int, int]] = set()
@@ -1055,6 +1062,7 @@ class AlgoGamesEnv(gym.Env):
         self._stones_collected = 0
         self._chests_hidden = 0
         self._chests_destroyed = 0
+        self._invalid_streak = 0
         self._hero_facing = (1, 0)  # RIGHT par defaut
 
         # Encode l'observation initiale.
@@ -1088,204 +1096,292 @@ class AlgoGamesEnv(gym.Env):
             return 0
         return int(self.elevation[y, x])
 
-    def _try_move(self, dx: int, dy: int) -> float:
-        """Tente de deplacer le hero. Retourne la reward.
-        Applique les regles du Twist :
-          - '#' / 'o' (F) ou 't' (M) : bloque, wall_hit_penalty
-          - delta elevation > 2 : bloque (Twist)
-          - Stamina insuffisante : bloque
-          - Sinon : deplace, cout stamina variable (1 base + 3 uphill + 0 downhill)
+    def _try_move(self, dx: int, dy: int) -> tuple[float, str]:
+        """Tente un mouvement et renvoie (reward, resultat).
+        Le reward direct est limite aux evenements du score. La progression vers
+        les objectifs est calculee separement dans step().
         """
-        wall_hit = float(self.reward_config.get("wall_hit", self._DEFAULT_WALL_HIT_PENALTY))
-        move_r = float(self.reward_config.get("move_reward", self._DEFAULT_MOVE_REWARD))
-        stone_r = float(self.reward_config.get("stone_collected", self._DEFAULT_STONE_REWARD))
-
         tx, ty = self._hero_x + dx, self._hero_y + dy
         terrain = self._terrain_at(tx, ty)
-
-        # Blocages de terrain.
-        if self.hero == "F" and terrain in ("#", "o", "t"):
-            return wall_hit
+        if self.hero == "F" and terrain in ("#", "t"):
+            return 0.0, "blocked_move"
         if self.hero == "M" and terrain in ("#", "o"):
-            return wall_hit
-
-        # Twist : delta elevation > 2 -> bloque.
-        delta = abs(self._elevation_at(tx, ty) - self._elevation_at(self._hero_x, self._hero_y))
-        if delta > 2:
-            return wall_hit
-
-        # Cout stamina.
-        cost = self._MOVE_STAMINA_COST
-        if self._elevation_at(tx, ty) > self._elevation_at(self._hero_x, self._hero_y):
-            cost += self._UPHILL_STAMINA_COST
-        elif self._elevation_at(tx, ty) < self._elevation_at(self._hero_x, self._hero_y):
-            cost = 0.0  # descente gratuite
+            return 0.0, "blocked_move"
+        start_x, start_y = self._hero_x, self._hero_y
+        hop = False
+        if self.hero == "F" and terrain == "o":
+            tx += dx
+            ty += dy
+            hop = True
+        elif self.hero == "M" and terrain == "t":
+            tx += dx
+            ty += dy
+            hop = True
+        landing = self._terrain_at(tx, ty)
+        if landing == "#":
+            return 0.0, "blocked_move"
+        if self.hero == "F" and landing in ("t", "o"):
+            return 0.0, "blocked_move"
+        if self.hero == "M" and landing in ("o", "t"):
+            return 0.0, "blocked_move"
+        start_elev = self._elevation_at(start_x, start_y)
+        target_elev = self._elevation_at(tx, ty)
+        delta = target_elev - start_elev
+        if delta >= 3 or delta <= -5:
+            return 0.0, "blocked_move"
+        if hop:
+            cost = 10.0
+        elif delta > 0:
+            cost = 3.0
+        elif delta < 0:
+            cost = 0.0
+        else:
+            cost = 1.0
         if self._stamina < cost:
-            return wall_hit
-
-        # Deplacement reussi.
+            return 0.0, "insufficient_stamina"
         self._hero_x, self._hero_y = tx, ty
         self._stamina -= cost
-        reward = move_r
-
-        # Collecte pierre si on est sur une pierre.
+        reward = 0.0
+        result = "move"
         if (tx, ty) in self._stone_positions:
             self._stone_positions.discard((tx, ty))
             self._stones_collected += 1
-            reward += stone_r
+            reward += float(self.reward_config.get("stone_collected", 25.0))
+            result = "stone_collected"
+        return reward, result
 
-        # Coffre cache (@) si on est dessus -> compte comme hidden.
-        if terrain == "@":
-            self._chests_hidden += 1
-            reward += float(self.reward_config.get(
-                "chest_hidden", self._DEFAULT_CHEST_HIDDEN_REWARD))
-
-        return reward
-
-    def _try_push(self, dx: int, dy: int) -> float:
-        """Tente de pousser un coffre. Retourne la reward.
-        Regles :
-          - Pas de coffre devant : wall_hit_penalty
-          - Coffre pousse vers '#' / 'o' / autre coffre / machine : bloque
-          - Coffre pousse vers '@' (hidden slot) : hidden!
-          - Coffre pousse vers un trou avec drop >= 5 : detruit (penalite)
-          - Coffre pousse vers un trou avec drop < 5 : tombe dans le trou (detruit, sans hidden)
-          - Sinon : pousse, le hero avance, cout stamina pousse
-        """
-        wall_hit = float(self.reward_config.get("wall_hit", self._DEFAULT_WALL_HIT_PENALTY))
-        chest_hidden_r = float(self.reward_config.get(
-            "chest_hidden", self._DEFAULT_CHEST_HIDDEN_REWARD))
-        chest_destroyed_p = float(self.reward_config.get(
-            "chest_destroyed", self._DEFAULT_CHEST_DESTROYED_PENALTY))
-
+    def _try_push(self, dx: int, dy: int) -> tuple[float, str]:
+        """Tente une poussée et renvoie (reward, résultat)."""
+        rc = self.reward_config
         cx, cy = self._hero_x + dx, self._hero_y + dy
         if (cx, cy) not in self._chest_positions:
-            return wall_hit  # pas de coffre a pousser
-
+            return float(rc.get("push_without_chest", -0.35)), "push_without_chest"
         bx, by = cx + dx, cy + dy
         terrain_beyond = self._terrain_at(bx, by)
-        if terrain_beyond == "#" or (bx, by) in self._machine_positions \
-           or (bx, by) in self._chest_positions:
-            return wall_hit
-
+        if (
+            terrain_beyond in ("#", "t")
+            or (bx, by) in self._machine_positions
+            or (bx, by) in self._chest_positions
+        ):
+            return float(rc.get("blocked_push", -0.25)), "blocked_push"
+        chest_elev = self._elevation_at(cx, cy)
+        target_elev = self._elevation_at(bx, by)
+        # Les héros ne peuvent pas pousser un coffre en montée.
+        if target_elev > chest_elev:
+            return float(rc.get("blocked_push", -0.25)), "blocked_push"
         if self._stamina < self._PUSH_STAMINA_COST:
-            return wall_hit
-
-        # Push reussi.
+            return float(rc.get("blocked_push", -0.25)), "insufficient_stamina"
+        old_dist = self._nearest_bush_distance(cx, cy)
         self._chest_positions.discard((cx, cy))
         self._stamina -= self._PUSH_STAMINA_COST
         self._hero_x, self._hero_y = cx, cy
-
-        if terrain_beyond == "@":
-            # Coffre pousse dans une cache -> hidden!
-            self._chests_hidden += 1
-            return chest_hidden_r
-        elif terrain_beyond == "o":
-            # Coffre tombe dans un trou -> detruit.
-            drop = abs(self._elevation_at(bx, by) - self._elevation_at(cx, cy))
+        drop = chest_elev - target_elev
+        if drop >= 5 or terrain_beyond == "o":
             self._chests_destroyed += 1
-            # GDD: drop >= 5 -> coffre detruit sans hidden. drop < 5 -> ?
-            # On penalise toujours la destruction (le squelette ne fait pas
-            # la distinction exacte, l'utilisateur affinera avec le GDD).
-            return chest_destroyed_p
-        else:
-            # Coffre pousse sur case libre : le coffre reste sur la map.
-            self._chest_positions.add((bx, by))
-            return float(self.reward_config.get("useful_push", 0.5))
+            return float(rc.get("voluntary_chest_loss", -50.0)), "chest_destroyed"
+        if terrain_beyond == "@":
+            self._chests_hidden += 1
+            return float(rc.get("chest_hidden", 150.0)), "chest_hidden"
+        self._chest_positions.add((bx, by))
+        new_dist = self._nearest_bush_distance(bx, by)
+        if new_dist < old_dist:
+            return float(rc.get("progress_chest_to_bush", 0.75)), "chest_progress"
+        if new_dist > old_dist:
+            return float(rc.get("regress_chest_from_bush", -0.75)), "chest_regress"
+        return 0.0, "chest_pushed"
+
+    def _nearest_distance(
+        self,
+        x: int,
+        y: int,
+        targets: set[tuple[int, int]],
+    ) -> int | None:
+        if not targets:
+            return None
+        return min(abs(tx - x) + abs(ty - y) for tx, ty in targets)
+    def _nearest_bush_distance(self, x: int, y: int) -> int:
+        bushes = {
+            (bx, by)
+            for by, row in enumerate(self.ascii_rows)
+            for bx, tile in enumerate(row)
+            if tile == "@"
+        }
+        if not bushes:
+            return self.width + self.height
+        return min(abs(bx - x) + abs(by - y) for bx, by in bushes)
+    def _objective_shaping(
+        self,
+        old_x: int,
+        old_y: int,
+        new_x: int,
+        new_y: int,
+    ) -> float:
+        rc = self.reward_config
+        reward = 0.0
+        old_stone = self._nearest_distance(old_x, old_y, self._stone_positions)
+        new_stone = self._nearest_distance(new_x, new_y, self._stone_positions)
+        if old_stone is not None and new_stone is not None:
+            if new_stone < old_stone:
+                reward += float(rc.get("progress_to_stone", 0.30))
+            elif new_stone > old_stone:
+                reward += float(rc.get("regress_from_stone", -0.30))
+        old_chest = self._nearest_distance(old_x, old_y, self._chest_positions)
+        new_chest = self._nearest_distance(new_x, new_y, self._chest_positions)
+        if old_chest is not None and new_chest is not None:
+            if new_chest < old_chest:
+                reward += float(rc.get("progress_to_chest", 0.40))
+            elif new_chest > old_chest:
+                reward += float(rc.get("regress_from_chest", -0.40))
+        return reward
 
     def step(self, action):
         a = int(action)
-        action_name = self.action_names[a] if 0 <= a < self.n_actions else "WAIT"
-        mask = self.action_mask()
-        is_invalid = not (0 <= a < self.n_actions and mask[a])
-
-        invalid_penalty = float(
-            self.reward_config.get("invalid_action", self._DEFAULT_INVALID_PENALTY)
-        )
-        idle_penalty = float(
-            self.reward_config.get("idle_action", self._DEFAULT_IDLE_PENALTY)
-        )
-        useful_hack_reward = float(
-            self.reward_config.get("useful_hack", self._DEFAULT_USEFUL_HACK_REWARD)
-        )
-
+        rc = self.reward_config
+        if not 0 <= a < self.n_actions:
+            action_name = "WAIT"
+            is_invalid = True
+        else:
+            action_name = self.action_names[a]
+            mask = self.action_mask()
+            is_invalid = not bool(mask[a])
         reward = 0.0
         terminated = False
         truncated = False
-
+        result = "invalid"
+        old_x, old_y = self._hero_x, self._hero_y
+        old_stamina = self._stamina
+        old_battery = self._battery
         if is_invalid:
-            reward = invalid_penalty
-            self._hack_action_count = 0
+            self._invalid_streak += 1
+            if action_name.startswith("PUSH_"):
+                reward += float(rc.get("push_without_chest", -0.35))
+                result = "invalid_push"
+            elif action_name == "HACK":
+                reward += float(rc.get("hack_without_machine", -0.35))
+                result = "invalid_hack"
+            elif action_name.startswith("HACK_"):
+                reward += float(rc.get("hack_action_without_riding", -0.35))
+                result = "invalid_hack_action"
+            else:
+                reward += float(rc.get("invalid_action", -0.25))
+                result = "invalid"
+            if self._invalid_streak >= 3:
+                reward += float(rc.get("repeated_invalid_action", -0.50))
         else:
-            # Mise a jour de la facing direction avant l'action.
-            dir_map = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
-            push_dir_map = {
-                "PUSH_UP": (0, -1), "PUSH_DOWN": (0, 1),
-                "PUSH_LEFT": (-1, 0), "PUSH_RIGHT": (1, 0),
+            self._invalid_streak = 0
+            dir_map = {
+                "UP": (0, -1),
+                "DOWN": (0, 1),
+                "LEFT": (-1, 0),
+                "RIGHT": (1, 0),
             }
-
+            push_dir_map = {
+                "PUSH_UP": (0, -1),
+                "PUSH_DOWN": (0, 1),
+                "PUSH_LEFT": (-1, 0),
+                "PUSH_RIGHT": (1, 0),
+            }
             if action_name == "HACK":
-                self._is_on_engine = True
-                self._battery = max(0.0, self._battery - 1.0)
-                self._hack_action_count = 0
-                reward = 0.0
+                # Le squelette ne suit pas le type et la position de chaque
+                # machine. Un HACK n'est accepte que si une machine est presente.
+                if (self._hero_x, self._hero_y) not in self._machine_positions:
+                    reward += float(rc.get("hack_without_machine", -0.35))
+                    result = "hack_without_machine"
+                elif self._battery < 1.0:
+                    reward += float(rc.get("wasted_battery", -0.30))
+                    result = "battery_empty"
+                else:
+                    self._is_on_engine = True
+                    self._battery -= 1.0
+                    self._hack_action_count = 0
+                    result = "hack"
             elif action_name == "WAIT":
                 if self._is_on_engine:
                     self._is_on_engine = False
                     self._hack_action_count = 0
-                    reward = useful_hack_reward * 0.5
+                    result = "unhack"
                 else:
-                    reward = idle_penalty
+                    if self._stamina >= self._MAX_STAMINA:
+                        reward += float(rc.get("wait_with_full_resources", -0.20))
+                    elif self._stamina > 95.0:
+                        reward += float(rc.get("wait_without_recovery_need", -0.05))
+                    else:
+                        self._stamina = min(self._MAX_STAMINA, self._stamina + 0.5)
+                    result = "wait"
             elif action_name in ("HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"):
-                self._battery = max(0.0, self._battery - 1.0)
-                self._hack_action_count += 1
-                reward = useful_hack_reward
-                if self._battery <= 0.0:
-                    self._is_on_engine = False
-                    self._hack_action_count = 0
+                if self._battery < 1.0:
+                    reward += float(rc.get("wasted_battery", -0.30))
+                    result = "battery_empty"
+                else:
+                    self._battery -= 1.0
+                    self._hack_action_count += 1
+                    if action_name in ("HACK_CW", "HACK_CCW"):
+                        reward += float(rc.get("useless_hack_rotation", -0.10))
+                        result = "hack_rotation"
+                    else:
+                        reward += float(rc.get("useful_hack", 0.20))
+                        result = action_name.lower()
             elif action_name in dir_map:
                 self._hero_facing = dir_map[action_name]
-                reward = self._try_move(*dir_map[action_name])
+                move_reward, result = self._try_move(*dir_map[action_name])
+                reward += move_reward
                 self._hack_action_count = 0
+                if result == "move":
+                    reward += self._objective_shaping(
+                        old_x, old_y, self._hero_x, self._hero_y
+                    )
+                elif result in ("blocked_move", "insufficient_stamina"):
+                    reward += float(rc.get("invalid_action", -0.25))
             elif action_name in push_dir_map:
                 self._hero_facing = push_dir_map[action_name]
-                reward = self._try_push(*push_dir_map[action_name])
+                push_reward, result = self._try_push(*push_dir_map[action_name])
+                reward += push_reward
                 self._hack_action_count = 0
-
-        # Avance du temps.
         self._tick += 1
         if self._tick >= self.max_time:
             truncated = True
-
-        # Epuisement stamina -> fin d'episode.
-        if self._stamina <= 0.0:
+            reward += float(rc.get("timeout", 0.0))
+        if self._stamina <= 0.0 and self._battery <= 0.0:
             terminated = True
-
-        # Re-encode l'observation avec le nouvel etat.
+            reward += float(rc.get("resource_exhausted", -5.0))
         self._encode_dynamic_grid()
         self._scalars_buf[0] = self._stamina / self._MAX_STAMINA
         self._scalars_buf[1] = self._battery / self._MAX_BATTERY
-        self._scalars_buf[2] = max(0.0, 1.0 - self._tick / max(1, self.max_time))
+        self._scalars_buf[2] = max(
+            0.0, 1.0 - self._tick / max(1, self.max_time)
+        )
         self._scalars_buf[3] = self._hero_x / max(1, self.width - 1)
         self._scalars_buf[4] = self._hero_y / max(1, self.height - 1)
         self._scalars_buf[5] = 1.0 if self._is_on_engine else 0.0
-
         info = {
             "hero": self.hero,
             "action_name": action_name,
+            "action_result": result,
             "is_on_engine": self._is_on_engine,
             "action_mask": self.action_mask().copy(),
             "invalid_action": is_invalid,
             "hero_pos": (self._hero_x, self._hero_y),
             "hero_stamina": self._stamina,
             "hero_battery": self._battery,
+            "stamina_spent": max(0.0, old_stamina - self._stamina),
+            "battery_spent": max(0.0, old_battery - self._battery),
             "tick": self._tick,
             "stones_collected": self._stones_collected,
             "chests_hidden": self._chests_hidden,
             "chests_destroyed": self._chests_destroyed,
+            "termination_reason": (
+                "resources_exhausted"
+                if terminated
+                else "timeout"
+                if truncated
+                else None
+            ),
         }
         return (
-            {"grid": self._grid_buf.copy(), "scalars": self._scalars_buf.copy()},
+            {
+                "grid": self._grid_buf.copy(),
+                "scalars": self._scalars_buf.copy(),
+            },
             float(reward),
             bool(terminated),
             bool(truncated),

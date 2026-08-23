@@ -158,7 +158,7 @@ def main() -> int:
         for h in ("F", "M"):
             grid_obs = build_grid(engine, h, elevation, engine_config, N_GRID_CHANNELS)
             scalars_obs = build_scalars(engine, h, N_SCALARS)
-            mask = action_mask(engine.on_engine[h] is not None, action_names[h])
+            mask = engine.legal_action_mask(h, action_names[h])
             chosen[h] = pick_action(sessions[h], action_names[h], grid_obs, scalars_obs, mask)
 
         engine.step(chosen)

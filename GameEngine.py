@@ -61,8 +61,16 @@ class GameEngine:
                     self.pos[c] = (x, y); self.terrain[y][x] = '.'
                 elif c in ('X', 'G'):
                     key = "excavator_initial_facing" if c == 'X' else "grappler_initial_facing"
-                    self.machines.append({"type": c, "x": x, "y": y, "facing": DIR[self.cfg[key]],
-                                           "hacked_by": None, "move_pending": False, "steps": 0})
+                    self.machines.append({
+                        "type": c,
+                        "x": x,
+                        "y": y,
+                        "facing": DIR[self.cfg[key]],
+                        "hacked_by": None,
+                        "move_pending": False,
+                        "steps": 0,
+                        "stones": 0,
+                    })
                     self.terrain[y][x] = '.'
         self.stamina = {"F": 100.0, "M": 100.0}
         self.battery = {"F": 100.0, "M": 100.0}
@@ -92,6 +100,18 @@ class GameEngine:
                 return i
         return None
 
+    def _transfer_machine_stones(self, machine_index: int) -> None:
+        machine = self.machines[machine_index]
+        amount = int(machine.get("stones", 0))
+        if amount <= 0:
+            return
+        mx, my = machine["x"], machine["y"]
+        for hero in ("F", "M"):
+            if self.pos[hero] == (mx, my):
+                self.stones_collected += amount
+                machine["stones"] = 0
+                return
+
     def hero_at(self, x, y, exclude=None):
         for h, (hx, hy) in self.pos.items():
             if h != exclude and hx == x and hy == y:
@@ -99,10 +119,15 @@ class GameEngine:
         return None
 
     def official_score(self):
-        s = self.stamina["F"] + self.stamina["M"]
-        b = self.battery["F"] + self.battery["M"]
-        t = max(0, self.max_time - self.tick)
-        return self.chests_hidden * 150 + self.stones_collected * 25 + (s + b) // 4 + t // 2
+        s = int(self.stamina["F"] + self.stamina["M"])
+        b = int(self.battery["F"] + self.battery["M"])
+        t = max(0, int(self.max_time - self.tick))
+        return (
+            int(self.chests_hidden) * 150
+            + int(self.stones_collected) * 25
+            + (s + b) // 4
+            + t // 2
+        )
 
     # ---- masque d'actions legales (cf. diagnostic "politique degeneree WAIT") --
     # L'ancien masque (is_on_engine seul) laisse passer des MOVE/PUSH/HACK
@@ -550,6 +575,9 @@ class GameEngine:
                     idx = self.chest_at(cx, cy)
                     self.stamina[h] -= self.cfg["chest_push_stamina_cost"]
                     self.pos[h] = (cx, cy)
+                    machine_index = self.machine_at(*self.pos[h])
+                    if machine_index is not None:
+                        self._transfer_machine_stones(machine_index)
                     drop = self.elev(cx, cy) - self.elev(bx, by)
                     if drop >= self.cfg["destroy_chest_drop"]:
                         del self.chests[idx]; self.chests_destroyed += 1; ev[h]["kind"] = "chest_cliff"
@@ -568,6 +596,9 @@ class GameEngine:
                         self.stones.discard((lx, ly))
                         self.stones_collected += 1
                         ev[h]["stone"] = True
+                    machine_index = self.machine_at(*self.pos[h])
+                    if machine_index is not None:
+                        self._transfer_machine_stones(machine_index)
                 self.regen[h] = 0.0
             else:
                 m = self.machines[ident]

@@ -22,55 +22,47 @@ from GameEngine import GameEngine
 _TILE_CHANNELS = {".": 0, "#": 1, "*": 2, "o": 3, "t": 4, "@": 5, "+": 6, "X": 7, "G": 8}
 _HERO_CH, _FACING_CH, _ABS_ELEV_CH, _REL_ELEV_CH, _NEXT_X_CH, _NEXT_G_CH = 9, 10, 11, 12, 13, 14
 
-_STREAK_LIMIT = 5
-_IDLE_STREAK_LIMIT = 15  # au dela, WAIT continue d'etre penalise en plus de idle_action
+_STREAK_LIMIT = 3
 _RESOURCE_LOW_TICKS_LIMIT = 10
-_SCORE_BONUS_SCALE = 0.02  # bonus terminal = score officiel GDD * scale
-
-# ---------------------------------------------------------------------------
-# REDESIGN RECOMPENSE (cf. diagnostic "politique degenere en WAIT permanent") :
-#
-# Constat empirique : sur 10k timesteps, les 30 trials Optuna convergeaient
-# TOUS vers le meme score (au bit pres), quels que soient les hyperparametres
-# testes -> preuve que la politique tombe sur un point fixe trivial (WAIT
-# partout) independant des hyperparametres. Cause racine, dans l'ancien
-# bareme :
-#   1. Un `move` reussi qui ne ramasse pas de pierre ne rapportait RIEN
-#      d'autre que `progress_to_objective` (poids 0.05) -> seul signal pour
-#      inciter a bouger, et il est minuscule.
-#   2. `voluntary_chest_loss` (-75) valait ~3750x le cout d'un WAIT (-0.02) :
-#      une seule maladresse pendant l'exploration aleatoire initiale suffit
-#      a rendre l'esperance de toute action risquee tres negative.
-#   3. WAIT n'avait aucun cout croissant : attendre indefiniment restait la
-#      strategie la moins pire, pour toujours.
-#
-# Correctifs (les 3 sont complementaires, aucun ne suffit seul) :
-#   - progress_to_objective x5 (0.05 -> 0.25) : signal dense a chaque tick,
-#     domine desormais le bruit d'une pénalité isolee sur un episode de
-#     500 ticks (jusqu'a +125 cumules si l'agent progresse constamment).
-#   - voluntary_chest_loss / chest_destroyed largement reduits (-75 -> -20,
-#     -35 -> -10) : reste clairement dissuasif mais n'ecrase plus a lui
-#     seul des dizaines de ticks de bon comportement dans l'estimation
-#     d'avantage de PPO.
-#   - prolonged_block adouci (-1.00 -> -0.50) : les series d'actions
-#     invalides pendant l'exploration aleatoire du debut ne doivent pas
-#     etre punies aussi durement qu'une perte de coffre volontaire.
-#   - idle_streak_penalty (nouveau) : au-dela de _IDLE_STREAK_LIMIT WAIT
-#     consecutifs, chaque WAIT supplementaire coute idle_action +
-#     idle_streak_penalty. Un episode 100% WAIT (500 ticks) coute desormais
-#     15*(-0.02) + 485*(-0.02-0.10) ~= -58.5, largement pire qu'une seule
-#     maladresse (-20), donc WAIT-permanent n'est plus un optimum local
-#     "sur" -- l'agent est force a explorer.
-# ---------------------------------------------------------------------------
-_REWARD_DEFAULTS = dict(
-    stone_collected=25.0, chest_hidden=150.0,
-    strategic_action=0.30, useful_hack=0.75, useful_fill=1.00, useful_cut=1.00,
-    useful_push=0.50, progress_to_objective=0.25,
-    invalid_action=-0.15, idle_action=-0.02, prolonged_block=-0.50,
-    idle_streak_penalty=-0.10,
-    chest_destroyed=-10.0, voluntary_chest_loss=-20.0,
-    resource_exhausted=-5.0, timeout=0.0,
-)
+# Le score officiel est injecte a la fin sous forme de difference avec le
+# score initial. Cela evite un bonus constant important, independant des
+# actions, et donne exactement la variation de performance officielle.
+_TERMINAL_SCORE_DELTA_SCALE = 1.0
+_REWARD_DEFAULTS = {
+    # Evenements du score officiel.
+    "stone_collected": 25.0,
+    "chest_hidden": 150.0,
+    # Shaping potentiel vers les objectifs qui produisent C et P.
+    "progress_to_stone": 0.30,
+    "regress_from_stone": -0.30,
+    "progress_to_chest": 0.40,
+    "regress_from_chest": -0.40,
+    "progress_chest_to_bush": 0.75,
+    "regress_chest_from_bush": -0.75,
+    # Actions machine utiles uniquement si elles ouvrent ou suivent un chemin
+    # vers une pierre, un coffre ou une cache.
+    "useful_hack": 0.20,
+    "useful_fill": 0.50,
+    "useful_cut": 0.50,
+    # Invalidite et gaspillage.
+    "invalid_action": -0.25,
+    "repeated_invalid_action": -0.50,
+    "wait_with_full_resources": -0.20,
+    "wait_without_recovery_need": -0.05,
+    "push_without_chest": -0.35,
+    "blocked_push": -0.25,
+    "hack_without_machine": -0.35,
+    "hack_action_without_riding": -0.35,
+    "useless_hack_rotation": -0.10,
+    "blocked_hack_move": -0.20,
+    "wasted_battery": -0.30,
+    # Perte d'un objectif.
+    "chest_destroyed": -25.0,
+    "voluntary_chest_loss": -50.0,
+    # Fin de partie.
+    "resource_exhausted": -5.0,
+    "timeout": 0.0,
+}
 
 
 def _augment(rows, elevation, mode):
@@ -197,7 +189,9 @@ class AlgoEnv(gym.Env):
         self.engine: GameEngine | None = None
         self._invalid_streak = 0
         self._idle_streak = 0
-        self._prev_dist = 0
+        self._prev_stone_dist: int | None = None
+        self._prev_chest_dist: int | None = None
+        self._initial_official_score = 0.0
         self._ep_len = 0
         self._ep_wait = 0
         self._ep_invalid = 0
@@ -240,13 +234,45 @@ class AlgoEnv(gym.Env):
             return self.augmentations[self._aug_cycle]
         return mode if mode in self.augmentations else "identity"
 
-    def _nearest_objective_dist(self):
+    def _nearest_distance(self, targets):
         e = self.engine
-        hx, hy = e.pos[self.hero]
-        targets = list(e.stones) + [(c[0], c[1]) for c in e.chests]
         if not targets:
-            return 0
+            return None
+        hx, hy = e.pos[self.hero]
         return min(abs(tx - hx) + abs(ty - hy) for tx, ty in targets)
+    def _nearest_stone_dist(self):
+        return self._nearest_distance(self.engine.stones)
+    def _nearest_chest_dist(self):
+        return self._nearest_distance(
+            {(int(cx), int(cy)) for cx, cy in self.engine.chests}
+        )
+    def _nearest_bush_distance(self, x: int, y: int) -> int | None:
+        bushes = {
+            (bx, by)
+            for by, row in enumerate(self.engine.terrain)
+            for bx, tile in enumerate(row)
+            if tile == "@"
+        }
+        if not bushes:
+            return None
+        return min(abs(bx - x) + abs(by - y) for bx, by in bushes)
+    @staticmethod
+    def _distance_reward(
+        previous: int | None,
+        current: int | None,
+        progress_reward: float,
+        regress_penalty: float,
+    ) -> float:
+        if previous is None or current is None:
+            return 0.0
+        if current < previous:
+            return progress_reward
+        if current > previous:
+            return regress_penalty
+        return 0.0
+    def _refresh_objective_distances(self) -> None:
+        self._prev_stone_dist = self._nearest_stone_dist()
+        self._prev_chest_dist = self._nearest_chest_dist()
 
     # ---- gym API ------------------------------------------------------------
     def reset(self, *, seed=None, options=None):
@@ -263,7 +289,8 @@ class AlgoEnv(gym.Env):
         )
         self._invalid_streak = 0
         self._idle_streak = 0
-        self._prev_dist = self._nearest_objective_dist()
+        self._refresh_objective_distances()
+        self._initial_official_score = float(self.engine.official_score())
         self._ep_len = 0
         self._ep_wait = 0
         self._ep_invalid = 0
@@ -271,88 +298,195 @@ class AlgoEnv(gym.Env):
 
     def step(self, action):
         e = self.engine
-        a_name = self.action_names[int(action)]
+        action_index = int(action)
+        a_name = self.action_names[action_index]
+        precise_mask = e.legal_action_mask(self.hero, self.action_names)
+        selected_is_legal = bool(precise_mask[action_index])
+        before_chests = {
+            (int(cx), int(cy))
+            for cx, cy in e.chests
+        }
+        before_hidden = e.chests_hidden
+        before_destroyed = e.chests_destroyed
+        before_battery = e.battery[self.hero]
         other_action = e.scripted_action(self.other)
-        # GameEngine invalide deja nativement toute action hors du contrat
-        # action_mask() (OFF_ENGINE_ACTIONS vs HACK_*), pas besoin de le
-        # revalider ici.
         ev = e.step({self.hero: a_name, self.other: other_action})
-        reward = self._reward(ev[self.hero], ev[self.other])
-
+        my = ev[self.hero]
+        other_ev = ev[self.other]
+        reward = self._reward(
+            my=my,
+            other_ev=other_ev,
+            requested_action=a_name,
+            selected_is_legal=selected_is_legal,
+            before_chests=before_chests,
+            before_hidden=before_hidden,
+            before_destroyed=before_destroyed,
+            before_battery=before_battery,
+        )
         self._ep_len += 1
-        if not ev[self.hero]["valid"]:
+        if not my["valid"]:
             self._ep_invalid += 1
-        elif ev[self.hero]["kind"] == "wait":
+        elif my["kind"] == "wait":
             self._ep_wait += 1
-
-        resource_low = e.resource_low_ticks[self.hero] >= _RESOURCE_LOW_TICKS_LIMIT
+        resource_low = (
+            e.resource_low_ticks[self.hero] >= _RESOURCE_LOW_TICKS_LIMIT
+        )
         cleared = not e.stones and not e.chests
         timeout = e.tick >= e.max_time
         terminated = bool(resource_low or cleared)
         truncated = bool(timeout and not terminated)
-
         info = self._info()
+        info["action_name"] = a_name
+        info["action_result"] = my["kind"]
         if resource_low:
             info["resources_exhausted"] = True
+            info["termination_reason"] = "resources_exhausted"
             reward += self.reward_config["resource_exhausted"]
+        elif cleared:
+            info["termination_reason"] = "objectives_cleared"
+        elif truncated:
+            info["termination_reason"] = "timeout"
+            reward += self.reward_config.get("timeout", 0.0)
         if terminated or truncated:
-            if truncated:
-                reward += self.reward_config.get("timeout", 0.0)
-            reward += e.official_score() * _SCORE_BONUS_SCALE
-
+            final_score = float(e.official_score())
+            score_delta = final_score - self._initial_official_score
+            # Les pierres et coffres ont deja produit leurs rewards exacts durant
+            # l'episode. Pour eviter le double comptage, le bonus terminal ne
+            # conserve que l'effet ressources + temps non deja redistribue.
+            direct_objective_score = (
+                e.stones_collected * 25.0
+                + e.chests_hidden * 150.0
+            )
+            residual_score_delta = score_delta - direct_objective_score
+            reward += residual_score_delta * _TERMINAL_SCORE_DELTA_SCALE
+            info["official_score"] = final_score
+            info["official_score_delta"] = score_delta
+            info["terminal_residual_score_delta"] = residual_score_delta
         return self._obs(), float(reward), terminated, truncated, info
 
-    def _reward(self, my, other_ev):
+    def _reward(
+        self,
+        my,
+        other_ev,
+        requested_action: str,
+        selected_is_legal: bool,
+        before_chests: set[tuple[int, int]],
+        before_hidden: int,
+        before_destroyed: int,
+        before_battery: float,
+    ):
         rc = self.reward_config
-        if not my["valid"]:
-            r = rc["invalid_action"]
+        e = self.engine
+        if not selected_is_legal or not my["valid"]:
             self._invalid_streak += 1
-            self._idle_streak = 0  # une tentative (meme ratee) n'est pas de la passivite
+            reward = self._invalid_penalty(requested_action, my["kind"])
             if self._invalid_streak >= _STREAK_LIMIT:
-                r += rc["prolonged_block"]
-            return r
+                reward += rc["repeated_invalid_action"]
+            self._refresh_objective_distances()
+            return reward
         self._invalid_streak = 0
-        r = 0.0
+        reward = 0.0
         kind = my["kind"]
-
-        # Suivi de la serie de WAIT consecutifs (kind=="wait" = attente HORS
-        # engine, choix delibere de ne rien faire ; distinct de "unhack"/
-        # "ride_wait" qui sont des ticks forces par la mecanique et ne
-        # doivent pas etre penalises comme de la passivite).
         if kind == "wait":
-            self._idle_streak += 1
-        else:
-            self._idle_streak = 0
-
-        if kind == "wait":
-            if self.engine.stamina[self.hero] >= 100.0:
-                r += rc["idle_action"]
-            if self._idle_streak > _IDLE_STREAK_LIMIT:
-                r += rc["idle_streak_penalty"]
+            stamina_full = e.stamina[self.hero] >= 100.0
+            battery_full = e.battery[self.hero] >= 100.0
+            if stamina_full and battery_full:
+                reward += rc["wait_with_full_resources"]
+            elif e.stamina[self.hero] >= 95.0:
+                reward += rc["wait_without_recovery_need"]
         elif kind == "hack":
-            r += rc["useful_hack"]
+            reward += rc["useful_hack"]
         elif kind == "hack_blocked_rotate":
-            r += rc["invalid_action"]
-        elif kind in ("hack_move_queued", "hack_cw", "hack_ccw"):
-            r += rc["strategic_action"]
+            reward += rc["blocked_hack_move"]
+        elif kind in ("hack_cw", "hack_ccw"):
+            reward += rc["useless_hack_rotation"]
         elif kind == "fill":
-            r += rc["useful_fill"]
+            reward += rc["useful_fill"]
         elif kind == "cut":
-            r += rc["useful_cut"]
-        elif kind == "chest_pushed":
-            r += rc["useful_push"]
+            reward += rc["useful_cut"]
         elif kind == "chest_hidden":
-            r += rc["chest_hidden"]
+            reward += rc["chest_hidden"]
         elif kind in ("chest_hole", "chest_cliff"):
-            r += rc["voluntary_chest_loss"]
+            reward += rc["voluntary_chest_loss"]
         if my.get("stone"):
-            r += rc["stone_collected"]
-        if other_ev["kind"] in ("chest_hole", "chest_cliff"):
-            r += rc["chest_destroyed"]
-        dist = self._nearest_objective_dist()
-        r += rc["progress_to_objective"] * max(-1, min(1, self._prev_dist - dist))
-        self._prev_dist = dist
-        return r
+            reward += rc["stone_collected"]
+        destroyed_delta = e.chests_destroyed - before_destroyed
+        if destroyed_delta > 0 and kind not in ("chest_hole", "chest_cliff"):
+            reward += rc["chest_destroyed"] * destroyed_delta
+        battery_spent = max(0.0, before_battery - e.battery[self.hero])
+        useful_battery_kinds = {
+            "hack",
+            "hack_move_queued",
+            "ride_wait",
+            "fill",
+            "cut",
+        }
+        if battery_spent > 0.0 and kind not in useful_battery_kinds:
+            reward += rc["wasted_battery"] * battery_spent
+        current_stone_dist = self._nearest_stone_dist()
+        current_chest_dist = self._nearest_chest_dist()
+        reward += self._distance_reward(
+            self._prev_stone_dist,
+            current_stone_dist,
+            rc["progress_to_stone"],
+            rc["regress_from_stone"],
+        )
+        reward += self._distance_reward(
+            self._prev_chest_dist,
+            current_chest_dist,
+            rc["progress_to_chest"],
+            rc["regress_from_chest"],
+        )
+        self._prev_stone_dist = current_stone_dist
+        self._prev_chest_dist = current_chest_dist
+        after_chests = {
+            (int(cx), int(cy))
+            for cx, cy in e.chests
+        }
+        if kind == "chest_pushed":
+            removed = before_chests - after_chests
+            added = after_chests - before_chests
+            if len(removed) == 1 and len(added) == 1:
+                old_pos = next(iter(removed))
+                new_pos = next(iter(added))
+                old_dist = self._nearest_bush_distance(*old_pos)
+                new_dist = self._nearest_bush_distance(*new_pos)
+                if (
+                    old_dist is not None
+                    and new_dist is not None
+                    and new_dist < old_dist
+                ):
+                    reward += rc["progress_chest_to_bush"]
+                elif (
+                    old_dist is not None
+                    and new_dist is not None
+                    and new_dist > old_dist
+                ):
+                    reward += rc["regress_chest_from_bush"]
+        return reward
+
+    def _invalid_penalty(self, requested_action: str, result_kind: str) -> float:
+        rc = self.reward_config
+        if requested_action.startswith("PUSH_"):
+            dx, dy = {
+                "PUSH_UP": (0, -1),
+                "PUSH_DOWN": (0, 1),
+                "PUSH_LEFT": (-1, 0),
+                "PUSH_RIGHT": (1, 0),
+            }[requested_action]
+            hx, hy = self.engine.pos[self.hero]
+            if self.engine.chest_at(hx + dx, hy + dy) is None:
+                return rc["push_without_chest"]
+            return rc["blocked_push"]
+        if requested_action == "HACK":
+            return rc["hack_without_machine"]
+        if requested_action.startswith("HACK_"):
+            if self.engine.on_engine[self.hero] is None:
+                return rc["hack_action_without_riding"]
+            if requested_action == "HACK_MOVE":
+                return rc["blocked_hack_move"]
+            return rc["invalid_action"]
+        return rc["invalid_action"]
 
 
 def make_env(**kwargs) -> AlgoEnv:
