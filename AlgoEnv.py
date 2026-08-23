@@ -29,26 +29,34 @@ _RESOURCE_LOW_TICKS_LIMIT = 10
 # actions, et donne exactement la variation de performance officielle.
 _TERMINAL_SCORE_DELTA_SCALE = 1.0
 _REWARD_DEFAULTS = {
-    # Evenements du score officiel.
+    # Evenements officiels.
     "stone_collected": 25.0,
     "chest_hidden": 150.0,
-    # Shaping potentiel vers les objectifs qui produisent C et P.
-    "progress_to_stone": 0.30,
-    "regress_from_stone": -0.30,
-    "progress_to_chest": 0.40,
-    "regress_from_chest": -0.40,
-    "progress_chest_to_bush": 0.75,
+    # Shaping potentiel vers les objectifs.
+    "progress_to_stone": 0.40,
+    "regress_from_stone": -0.20,
+    "progress_to_chest": 0.50,
+    "regress_from_chest": -0.25,
+    "progress_chest_to_bush": 1.00,
     "regress_chest_from_bush": -0.75,
-    # Actions machine utiles uniquement si elles ouvrent ou suivent un chemin
-    # vers une pierre, un coffre ou une cache.
-    "useful_hack": 0.20,
-    "useful_fill": 0.50,
-    "useful_cut": 0.50,
+    # Machines.
+    "useful_hack": 0.15,
+    "useful_fill": 0.75,
+    "useful_cut": 0.75,
+    # WAIT contextuel.
+    "step_time_cost": -0.05,
+    "wait_recovery_per_stamina": 0.10,
+    "wait_forced": 0.0,
+    "wait_useful_machine": 0.10,
+    "wait_unhack": -0.03,
+    "wait_no_productive_action": -0.10,
+    "wait_productive_action_available": -0.75,
+    "wait_full_resources": -1.00,
+    "repeated_wait_2": -0.50,
+    "repeated_wait_3_plus": -1.25,
     # Invalidite et gaspillage.
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,
-    "wait_with_full_resources": -0.20,
-    "wait_without_recovery_need": -0.05,
     "push_without_chest": -0.35,
     "blocked_push": -0.25,
     "hack_without_machine": -0.35,
@@ -256,6 +264,19 @@ class AlgoEnv(gym.Env):
         if not bushes:
             return None
         return min(abs(bx - x) + abs(by - y) for bx, by in bushes)
+
+    def _has_productive_action(self) -> bool:
+        """Indique si le hero peut faire autre chose qu'attendre utilement."""
+        e = self.engine
+        mask = e.legal_action_mask(self.hero, self.action_names)
+        for index, name in enumerate(self.action_names):
+            if not mask[index] or name == "WAIT":
+                continue
+            if name in ("HACK_CW", "HACK_CCW"):
+                continue
+            return True
+        return False
+
     @staticmethod
     def _distance_reward(
         previous: int | None,
@@ -309,6 +330,8 @@ class AlgoEnv(gym.Env):
         before_hidden = e.chests_hidden
         before_destroyed = e.chests_destroyed
         before_battery = e.battery[self.hero]
+        before_stamina = e.stamina[self.hero]
+        productive_action_available = self._has_productive_action()
         other_action = e.scripted_action(self.other)
         ev = e.step({self.hero: a_name, self.other: other_action})
         my = ev[self.hero]
@@ -322,6 +345,8 @@ class AlgoEnv(gym.Env):
             before_hidden=before_hidden,
             before_destroyed=before_destroyed,
             before_battery=before_battery,
+            before_stamina=before_stamina,
+            productive_action_available=productive_action_available,
         )
         self._ep_len += 1
         if not my["valid"]:
@@ -374,36 +399,71 @@ class AlgoEnv(gym.Env):
         before_hidden: int,
         before_destroyed: int,
         before_battery: float,
+        before_stamina: float,
+        productive_action_available: bool,
     ):
         rc = self.reward_config
         e = self.engine
+        reward = rc.get("step_time_cost", -0.05)
         if not selected_is_legal or not my["valid"]:
             self._invalid_streak += 1
-            reward = self._invalid_penalty(requested_action, my["kind"])
+            reward += self._invalid_penalty(requested_action, my["kind"])
             if self._invalid_streak >= _STREAK_LIMIT:
                 reward += rc["repeated_invalid_action"]
             self._refresh_objective_distances()
             return reward
         self._invalid_streak = 0
-        reward = 0.0
         kind = my["kind"]
         if kind == "wait":
-            if e.stamina[self.hero] <= 0.0 or e.battery[self.hero] <= 0.0:
-                reward += rc["wait_with_full_resources"]
-        elif kind == "hack":
-            reward += rc["useful_hack"]
-        elif kind == "hack_blocked_rotate":
-            reward += rc["blocked_hack_move"]
-        elif kind in ("hack_cw", "hack_ccw"):
-            reward += rc["useless_hack_rotation"]
-        elif kind == "fill":
-            reward += rc["useful_fill"]
+            recovered = max(0.0, e.stamina[self.hero] - before_stamina)
+            if recovered > 0.0:
+                reward += rc["wait_recovery_per_stamina"] * recovered
+                self._idle_streak = 0
+            else:
+                self._idle_streak += 1
+                resources_full = (
+                    e.stamina[self.hero] >= 99.999
+                    and e.battery[self.hero] >= 99.999
+                )
+                if resources_full:
+                    reward += rc["wait_full_resources"]
+                elif productive_action_available:
+                    reward += rc["wait_productive_action_available"]
+                else:
+                    reward += rc["wait_no_productive_action"]
+                if self._idle_streak == 2:
+                    reward += rc["repeated_wait_2"]
+                elif self._idle_streak >= 3:
+                    reward += rc["repeated_wait_3_plus"]
+        elif kind == "ride_wait":
+            reward += rc["wait_forced"]
+            self._idle_streak = 0
         elif kind == "cut":
             reward += rc["useful_cut"]
+            self._idle_streak = 0
+        elif kind == "unhack":
+            reward += rc["wait_unhack"]
+            self._idle_streak = 0
+        elif kind == "hack":
+            reward += 0.0
+            self._idle_streak = 0
+        elif kind == "hack_blocked_rotate":
+            reward += rc["blocked_hack_move"]
+            self._idle_streak = 0
+        elif kind in ("hack_cw", "hack_ccw"):
+            reward += rc["useless_hack_rotation"]
+            self._idle_streak = 0
+        elif kind == "fill":
+            reward += rc["useful_fill"]
+            self._idle_streak = 0
         elif kind == "chest_hidden":
             reward += rc["chest_hidden"]
+            self._idle_streak = 0
         elif kind in ("chest_hole", "chest_cliff"):
             reward += rc["voluntary_chest_loss"]
+            self._idle_streak = 0
+        else:
+            self._idle_streak = 0
         if my.get("stone"):
             reward += rc["stone_collected"]
         destroyed_delta = e.chests_destroyed - before_destroyed
@@ -416,6 +476,7 @@ class AlgoEnv(gym.Env):
             "ride_wait",
             "fill",
             "cut",
+            "unhack",
         }
         if battery_spent > 0.0 and kind not in useful_battery_kinds:
             reward += rc["wasted_battery"] * battery_spent

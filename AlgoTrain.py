@@ -189,43 +189,45 @@ DEFAULT_ENGINE_CONFIG = {
 # rapprochement d'un objectif, conservation des ressources et prevention de
 # la perte d'un coffre.
 DEFAULT_REWARD_CONFIG = {
-    # Evenements qui augmentent directement le score officiel.
+    # Evenements officiels.
     "stone_collected": 25.0,
     "chest_hidden": 150.0,
-    # Progression vers les deux objectifs officiels.
-    "progress_to_stone": 0.30,
-    "regress_from_stone": -0.30,
-    "progress_to_chest": 0.40,
-    "regress_from_chest": -0.40,
-    "progress_chest_to_bush": 0.75,
+    # Shaping de progression.
+    "progress_to_stone": 0.40,
+    "regress_from_stone": -0.20,
+    "progress_to_chest": 0.50,
+    "regress_from_chest": -0.25,
+    "progress_chest_to_bush": 1.00,
     "regress_chest_from_bush": -0.75,
-    # Une action de machine n'est recompensee que si elle rapproche le hero
-    # d'une pierre, d'un coffre, ou ouvre un chemin vers un de ces objectifs.
-    "useful_hack": 0.20,
-    "useful_fill": 0.50,
-    "useful_cut": 0.50,
-    # Preservation des composantes S et B du score final.
-    # Le cout normal de stamina/batterie est deja visible dans le score :
-    # aucune penalite generique supplementaire n'est appliquee aux actions
-    # valides. Seul le gaspillage manifeste est penalise.
+    # Machines.
+    "useful_hack": 0.15,
+    "useful_fill": 0.75,
+    "useful_cut": 0.75,
+    # WAIT contextuel.
+    "step_time_cost": -0.05,
+    "wait_recovery_per_stamina": 0.10,
+    "wait_forced": 0.0,
+    "wait_useful_machine": 0.10,
+    "wait_unhack": -0.03,
+    "wait_no_productive_action": -0.10,
+    "wait_productive_action_available": -0.75,
+    "wait_full_resources": -1.00,
+    "repeated_wait_2": -0.50,
+    "repeated_wait_3_plus": -1.25,
+    # Invalidite et gaspillage.
     "wasted_battery": -0.30,
     "resource_exhausted": -5.0,
-    # Actions invalides ou inutiles.
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,
-    "wait_with_full_resources": -0.20,
-    "wait_without_recovery_need": -0.05,
     "push_without_chest": -0.35,
     "blocked_push": -0.25,
     "hack_without_machine": -0.35,
     "hack_action_without_riding": -0.35,
     "useless_hack_rotation": -0.10,
     "blocked_hack_move": -0.20,
-    # Perte d'un objectif du score.
+    # Perte de coffre.
     "chest_destroyed": -25.0,
     "voluntary_chest_loss": -50.0,
-    # Le timeout ne doit pas ajouter une penalite arbitraire : le temps restant
-    # T est deja inclus exactement dans le bonus terminal du score officiel.
     "timeout": 0.0,
 }
 
@@ -1307,12 +1309,17 @@ class AlgoGamesEnv(gym.Env):
                         if name in ("UP", "DOWN", "LEFT", "RIGHT", "PUSH_UP", "PUSH_DOWN", "PUSH_LEFT", "PUSH_RIGHT", "HACK")
                         and self.action_mask()[self.action_names.index(name)]
                     )
-                    if self._stamina <= 0.0 or self._battery <= 0.0:
-                        reward += float(rc.get("wait_with_full_resources", -0.20))
+                    before_stamina = self._stamina
+                    self._stamina = min(self._MAX_STAMINA, self._stamina + 0.5)
+                    recovered = max(0.0, self._stamina - before_stamina)
+                    if recovered > 0.0:
+                        reward += float(rc.get("wait_recovery_per_stamina", 0.10)) * recovered
+                    elif self._stamina >= 99.999 and self._battery >= 99.999:
+                        reward += float(rc.get("wait_full_resources", -1.00))
                     elif legal_moves > 0:
-                        reward += float(rc.get("wait_with_full_resources", -0.80))
+                        reward += float(rc.get("wait_productive_action_available", -0.75))
                     else:
-                        self._stamina = min(self._MAX_STAMINA, self._stamina + 0.5)
+                        reward += float(rc.get("wait_no_productive_action", -0.10))
                     result = "wait"
             elif action_name in ("HACK_MOVE", "HACK_FILL", "HACK_CW", "HACK_CCW"):
                 if self._battery < 1.0:
