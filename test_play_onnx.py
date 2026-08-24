@@ -81,3 +81,81 @@ def test_format_actions_lines_matches_gdd_format():
     for line in lines[:-1]:
         left, right = line.split(" | ")
         assert left and right
+
+
+# ----------------------------------------------------------------------------
+# Tests des correctifs apportes au diagnostic (causes 1, 3, 4)
+# ----------------------------------------------------------------------------
+
+def test_reward_defaults_symmetric_shaping():
+    """Cause 3 : progress et |regress| doivent etre symetriques pour qu'un
+    aller-retour ait un gain net nul et ne declenche pas d'oscillation."""
+    from AlgoEnv import _REWARD_DEFAULTS as rd
+    assert rd["progress_to_stone"] == -rd["regress_from_stone"]
+    assert rd["progress_to_chest"] == -rd["regress_from_chest"]
+
+
+def test_reward_defaults_wait_penalties_reinforced():
+    """Cause 1+4 : les penalites WAIT doivent etre assez fortes pour que
+    l'agent n'apprenne jamais WAIT quand une action productive est legale."""
+    from AlgoEnv import _REWARD_DEFAULTS as rd
+    assert rd["wait_productive_action_available"] <= -1.50
+    assert rd["wait_full_resources"] <= -2.00
+    assert rd["repeated_wait_3_plus"] <= -2.00
+
+
+def test_potential_coefficients_reinforced():
+    """Cause 1 : le potentiel doit etre >= 3x le cout par pas (0.05) afin
+    que le gain net du shaping telescoping surpasse la penalite d'action
+    invalide (-0.25)."""
+    from AlgoEnv import AlgoEnv
+    # On inspecte le source : les coefficients doivent etre -0.60 / -0.75.
+    import inspect
+    src = inspect.getsource(AlgoEnv._potential)
+    assert "-0.60" in src
+    assert "-0.75" in src
+
+
+def test_algoenv_algo_train_reward_configs_aligned():
+    """Le reward_config de l'env et celui de l'entrainement doivent etre
+    strictement alignes pour eviter un dephasage de signal."""
+    from AlgoEnv import _REWARD_DEFAULTS as env_rc
+    from AlgoTrain import DEFAULT_REWARD_CONFIG as train_rc
+    common = set(env_rc) & set(train_rc)
+    for k in common:
+        assert env_rc[k] == train_rc[k], f"dephasage sur {k}: env={env_rc[k]} train={train_rc[k]}"
+
+
+def test_has_productive_action_includes_push_and_hack():
+    """Cause 4 : _has_productive_action doit reconnaitre PUSH_* et HACK hors
+    engine comme productifs, sinon la penalite wait_productive_action_available
+    tombe a wait_no_productive_action et l'agent apprend a WAIT."""
+    from AlgoEnv import AlgoEnv
+    import inspect
+    src = inspect.getsource(AlgoEnv._has_productive_action)
+    assert "PUSH_UP" in src and "PUSH_DOWN" in src
+    assert "HACK_MOVE" in src and "HACK_FILL" in src
+
+
+def test_playonnx_uses_legal_action_mask_not_structural():
+    """Cause 2 : PlayOnnx.main() doit appeler legal_action_mask (precis),
+    pas structural_action_mask (qui autorise des actions converties en
+    implicit_wait par le moteur -> politique degénérée WAIT)."""
+    import inspect, PlayOnnx
+    src = inspect.getsource(PlayOnnx.main)
+    code_lines = [l for l in src.splitlines()
+                  if "legal_action_mask" in l and not l.strip().startswith("#")]
+    assert code_lines, "PlayOnnx.main n'appelle pas legal_action_mask"
+    structural_lines = [l for l in src.splitlines()
+                        if "structural_action_mask" in l and not l.strip().startswith("#")]
+    assert not structural_lines, "PlayOnnx.main utilise encore structural_action_mask"
+
+
+def test_playonnx_has_anti_stuck_logic():
+    """Cause 4 / boucle WAIT infinie : apres STUCK_THRESHOLD WAIT consecutifs,
+    PlayOnnx doit forcer une action hors-WAIT tiree au hasard."""
+    import inspect, PlayOnnx
+    src = inspect.getsource(PlayOnnx.main)
+    assert "STUCK_THRESHOLD" in src
+    assert "consecutive_waits" in src
+    assert "random.choice" in src

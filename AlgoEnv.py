@@ -33,10 +33,10 @@ _REWARD_DEFAULTS = {
     "stone_collected": 25.0,
     "chest_hidden": 150.0,
     # Shaping potentiel vers les objectifs.
-    "progress_to_stone": 0.40,
-    "regress_from_stone": -0.20,
-    "progress_to_chest": 0.50,
-    "regress_from_chest": -0.25,
+    "progress_to_stone": 0.50,
+    "regress_from_stone": -0.50,
+    "progress_to_chest": 0.60,
+    "regress_from_chest": -0.60,
     "progress_chest_to_bush": 1.00,
     "regress_chest_from_bush": -0.75,
     # Machines.
@@ -50,10 +50,10 @@ _REWARD_DEFAULTS = {
     "wait_useful_machine": 0.10,
     "wait_unhack": -0.03,
     "wait_no_productive_action": -0.10,
-    "wait_productive_action_available": -0.75,
-    "wait_full_resources": -1.00,
-    "repeated_wait_2": -0.50,
-    "repeated_wait_3_plus": -1.25,
+    "wait_productive_action_available": -1.50,   # etait -0.75 -> renforce
+    "wait_full_resources": -2.00,                # etait -1.00 -> renforce
+    "repeated_wait_2": -0.75,                    # etait -0.50 -> renforce
+    "repeated_wait_3_plus": -2.00,               # etait -1.25 -> renforce
     # Invalidite et gaspillage.
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,
@@ -63,7 +63,7 @@ _REWARD_DEFAULTS = {
     "hack_action_without_riding": -0.35,
     "useless_hack_rotation": -0.10,
     "blocked_hack_move": -0.20,
-    "wasted_battery": -0.30,
+    "wasted_battery": -0.25,
     # Perte d'un objectif.
     "chest_destroyed": -25.0,
     "voluntary_chest_loss": -50.0,
@@ -81,17 +81,14 @@ _REWARD_DEFAULTS = {
     "rotation_away_from_target": -0.15,
     "hack_move_progress": 0.35,
     "hack_move_regress": -0.20,
-    "blocked_hack_move": -0.20,
     "fill_useful_hole": 2.00,
     "fill_irrelevant_hole": -0.10,
     "cut_useful_tree": 2.00,
     "cut_irrelevant_tree": -0.10,
-    "wasted_battery": -0.25,
     "resource_score_delta_scale": 0.25,
-    "wait_productive_action_available": -0.20,
     "machine_stone_recovered": 25.0,
     "machine_stone_stolen_by_other": 0.0,
-    "objectives_cleared": 20.0,
+    "objectives_cleared": 50.0,                  # etait 20.0 -> bonus terminal renforce
 }
 
 
@@ -287,15 +284,33 @@ class AlgoEnv(gym.Env):
         return min(abs(bx - x) + abs(by - y) for bx, by in bushes)
 
     def _has_productive_action(self) -> bool:
-        """Indique si le hero peut faire autre chose qu'attendre utilement."""
+        """Indique si le hero a une action utile autre que WAIT/HACK_CW/HACK_CCW.
+
+        Detection elargie par rapport au masque par defaut : on regarde aussi
+        PUSH_* (pousser un coffre vers une buisson) et HACK (monter sur une
+        machine cible) hors engine, ainsi que HACK_MOVE / HACK_FILL sur engine.
+        Cela evite que la penalite `wait_productive_action_available` ne tombe a
+        -0.10 (wait_no_productive_action) quand une action utile existe en
+        realite : cf. diagnostic Cause 4.
+        """
         e = self.engine
         mask = e.legal_action_mask(self.hero, self.action_names)
+        riding = e.on_engine[self.hero] is not None
         for index, name in enumerate(self.action_names):
             if not mask[index] or name == "WAIT":
                 continue
             if name in ("HACK_CW", "HACK_CCW"):
                 continue
-            return True
+            # Sur engine : HACK_MOVE et HACK_FILL sont productifs.
+            if riding and name in ("HACK_MOVE", "HACK_FILL"):
+                return True
+            # Hors engine : MOVE, PUSH, HACK sont productifs.
+            if not riding and name in (
+                "UP", "DOWN", "LEFT", "RIGHT",
+                "PUSH_UP", "PUSH_DOWN", "PUSH_LEFT", "PUSH_RIGHT",
+                "HACK",
+            ):
+                return True
         return False
 
     @staticmethod
@@ -516,14 +531,32 @@ class AlgoEnv(gym.Env):
         }
         if battery_spent > 0.0 and kind not in useful_battery_kinds:
             reward += rc["wasted_battery"] * battery_spent
-        # NOTE (fix oscillation UP/DOWN|LEFT/RIGHT) : le shaping pas-a-pas
-        # _distance_reward() etait asymetrique (progress > |regress|), ce qui
-        # rendait un aller-retour net positif meme cumule avec _potential().
-        # _potential() (telescoping, cf. step()) porte deja tout le signal de
-        # rapprochement stone/chest sans ce defaut ; on ne fait plus que
-        # rafraichir le cache de distance pour le reste de la classe.
-        self._prev_stone_dist = self._nearest_stone_dist()
-        self._prev_chest_dist = self._nearest_chest_dist()
+        # --- Shaping distance pas-a-pas (coefficients SYMETRIQUES) ---
+        # Un aller-retour donne un gain net de zero -> pas d'oscillation.
+        # Le bloc precedent etait commentaire (cf. diagnostic Cause 3) ce qui
+        # privait l'agent de tout feedback immediat sur la qualite de ses
+        # mouvements. On reintroduit le shaping avec progress = |regress| pour
+        # neutraliser le farming oscillant, et on l'exclut sur les kinds non
+        # volontaires (wait, implicit_wait, invalid, hack_blocked_rotate,
+        # unhack, ride_wait, chest_*) pour ne pas bruiter le signal avec des
+        # evenements qui ne changent pas reellement la distance.
+        new_stone_dist = self._nearest_stone_dist()
+        new_chest_dist = self._nearest_chest_dist()
+        if kind not in (
+            "chest_pushed", "chest_hole", "chest_cliff",
+            "wait", "ride_wait", "unhack", "hack_blocked_rotate",
+            "implicit_wait", "invalid",
+        ):
+            reward += self._distance_reward(
+                self._prev_stone_dist, new_stone_dist,
+                rc["progress_to_stone"], rc["regress_from_stone"],
+            )
+            reward += self._distance_reward(
+                self._prev_chest_dist, new_chest_dist,
+                rc["progress_to_chest"], rc["regress_from_chest"],
+            )
+        self._prev_stone_dist = new_stone_dist
+        self._prev_chest_dist = new_chest_dist
         after_chests = {
             (int(cx), int(cy))
             for cx, cy in e.chests
@@ -555,12 +588,21 @@ class AlgoEnv(gym.Env):
         return 0.25 * (e.stamina[self.hero] + e.battery[self.hero]) + 0.25 * max(0, e.max_time - e.tick)
 
     def _potential(self) -> float:
+        """Potentiel F(s) pour shaping telescoping F(s,a,s') = gamma*Phi(s') - Phi(s).
+
+        Coefficients x3 par rapport au reglage original (-0.20 -> -0.60 pour
+        les pierres, -0.25 -> -0.75 pour les coffres) afin que le gain net
+        par pas vers un objectif (0.55-0.70 apres soustraction de step_time_cost)
+        surpasse largement la penalite d'action invalide (-0.25). Sans ce
+        renforcement, l'agent apprend que WAIT est plus sur que n'importe quel
+        mouvement (cf. diagnostic Cause 1).
+        """
         e = self.engine
         stone_d = self._nearest_stone_dist()
         chest_d = self._nearest_chest_dist()
-        stone_term = 0.0 if stone_d is None else -0.20 * stone_d
-        chest_term = 0.0 if chest_d is None else -0.25 * chest_d
-        resource_term = 0.0025 * (e.stamina[self.hero] + e.battery[self.hero])
+        stone_term = 0.0 if stone_d is None else -0.60 * stone_d   # x3
+        chest_term = 0.0 if chest_d is None else -0.75 * chest_d   # x3
+        resource_term = 0.005 * (e.stamina[self.hero] + e.battery[self.hero])
         return stone_term + chest_term + resource_term
 
     def _invalid_penalty(self, requested_action: str, result_kind: str) -> float:

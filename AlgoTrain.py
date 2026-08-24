@@ -203,31 +203,29 @@ DEFAULT_REWARD_CONFIG = {
     # Evenements officiels.
     "stone_collected": 25.0,
     "chest_hidden": 150.0,
-    # Shaping de progression.
-    "progress_to_stone": 0.40,
-    "regress_from_stone": -0.20,
-    "progress_to_chest": 0.50,
-    "regress_from_chest": -0.25,
+    # Shaping de progression (SYMÉTRIQUE — un aller-retour a un gain net nul).
+    "progress_to_stone": 0.50,
+    "regress_from_stone": -0.50,
+    "progress_to_chest": 0.60,
+    "regress_from_chest": -0.60,
     "progress_chest_to_bush": 1.00,
     "regress_chest_from_bush": -0.75,
     # Machines.
     "useful_hack": 0.15,
     "useful_fill": 0.75,
     "useful_cut": 0.75,
-    # WAIT contextuel.
+    # WAIT contextuel (PÉNALITÉS RENFORCÉES — voir diagnostic Cause 1+4).
     "step_time_cost": -0.05,
     "wait_recovery_per_stamina": 0.10,
     "wait_forced": 0.0,
     "wait_useful_machine": 0.10,
     "wait_unhack": -0.03,
     "wait_no_productive_action": -0.10,
-    "wait_productive_action_available": -0.75,
-    "wait_full_resources": -1.00,
-    "repeated_wait_2": -0.50,
-    "repeated_wait_3_plus": -1.25,
+    "wait_productive_action_available": -1.50,   # etait -0.75 -> renforce
+    "wait_full_resources": -2.00,                # etait -1.00 -> renforce
+    "repeated_wait_2": -0.75,                    # etait -0.50 -> renforce
+    "repeated_wait_3_plus": -2.00,               # etait -1.25 -> renforce
     # Invalidite et gaspillage.
-    "wasted_battery": -0.30,
-    "resource_exhausted": -5.0,
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,
     "push_without_chest": -0.35,
@@ -236,11 +234,13 @@ DEFAULT_REWARD_CONFIG = {
     "hack_action_without_riding": -0.35,
     "useless_hack_rotation": -0.10,
     "blocked_hack_move": -0.20,
+    "wasted_battery": -0.25,
     # Perte de coffre.
     "chest_destroyed": -25.0,
     "voluntary_chest_loss": -50.0,
+    "resource_exhausted": -5.0,
     "timeout": 0.0,
-    # Expanded reward keys to match AlgoEnv extended defaults
+    # Additional shaping / penalties (expanded strategy).
     "implicit_wait": -0.20,
     "blocked_move": -0.15,
     "insufficient_stamina": -0.10,
@@ -251,17 +251,14 @@ DEFAULT_REWARD_CONFIG = {
     "rotation_away_from_target": -0.15,
     "hack_move_progress": 0.35,
     "hack_move_regress": -0.20,
-    "blocked_hack_move": -0.20,
     "fill_useful_hole": 2.00,
     "fill_irrelevant_hole": -0.10,
     "cut_useful_tree": 2.00,
     "cut_irrelevant_tree": -0.10,
-    "wasted_battery": -0.25,
     "resource_score_delta_scale": 0.25,
-    "wait_productive_action_available": -0.20,
     "machine_stone_recovered": 25.0,
     "machine_stone_stolen_by_other": 0.0,
-    "objectives_cleared": 20.0,
+    "objectives_cleared": 50.0,                  # etait 20.0 -> bonus terminal renforce
 }
 
 
@@ -343,7 +340,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef", type=float, default=0.05,
+                        help="Coefficient d'entropie (exploration). Augmente de 0.01 a 0.05 "
+                             "pour favoriser l'exploration et casser la politique degénérée WAIT "
+                             "(cf. diagnostic).")
     parser.add_argument("--eval-freq", type=int, default=25_000)
     parser.add_argument("--checkpoint-freq", type=int, default=50_000)
     parser.add_argument("--resume", help="Modele .zip a reprendre.")

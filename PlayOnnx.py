@@ -18,6 +18,7 @@ test_play_onnx.py -q`. `--selftest` lance cette suite avant de jouer.
 from __future__ import annotations
 
 import argparse
+import random
 import subprocess
 import sys
 import time
@@ -41,6 +42,7 @@ from AlgoTrain import (
 from GameEngine import GameEngine
 
 RESOURCE_LOW_TICKS_LIMIT = 10  # meme seuil que AlgoEnv._RESOURCE_LOW_TICKS_LIMIT
+STUCK_THRESHOLD = 5            # ticks consecutifs de WAIT avant forçage exploration
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,13 +159,41 @@ def main() -> int:
     print(f"[tick 0] score={engine.official_score()}")
 
     tick = 0
+    consecutive_waits: dict[str, int] = {"F": 0, "M": 0}
     while tick < max_action_ticks:
         chosen: dict[str, str] = {}
         for h in ("F", "M"):
             grid_obs = build_grid(engine, h, elevation, engine_config, N_GRID_CHANNELS)
             scalars_obs = build_scalars(engine, h, N_SCALARS)
-            mask = engine.structural_action_mask(h, action_names[h])
-            chosen[h] = pick_action(sessions[h], action_names[h], grid_obs, scalars_obs, mask)
+            # ★ legal_action_mask (pas structural) : n'autorise QUE les actions
+            # physiquement valides. structural_action_mask laissait passer des
+            # PUSH_* sans coffre / HACK_* sans batterie -> implicit_wait au
+            # moteur -> aucune action reelle ne se produisait -> politique
+            # degénérée WAIT (cf. diagnostic Cause 2).
+            mask = engine.legal_action_mask(h, action_names[h])
+
+            # Anti-blocage : si le hero WAIT depuis STUCK_THRESHOLD ticks
+            # consecutifs, on force une action legale hors-WAIT tiree au hasard
+            # pour casser le cycle. Evite qu'un ONNX dégénéré boucle à l'infini
+            # sur WAIT (cf. diagnostic Cause 4 / boucle WAIT infinie).
+            if consecutive_waits[h] >= STUCK_THRESHOLD:
+                move_indices = [
+                    i for i, (valid, name) in enumerate(zip(mask, action_names[h]))
+                    if valid and name != "WAIT"
+                ]
+                if move_indices:
+                    chosen[h] = action_names[h][random.choice(move_indices)]
+                else:
+                    chosen[h] = "WAIT"
+            else:
+                chosen[h] = pick_action(
+                    sessions[h], action_names[h], grid_obs, scalars_obs, mask
+                )
+
+            if chosen[h] == "WAIT":
+                consecutive_waits[h] += 1
+            else:
+                consecutive_waits[h] = 0
 
         engine.step(chosen)
         tick += 1
@@ -180,12 +210,13 @@ def main() -> int:
             if not args.no_render:
                 print(f"\n=== tick {tick} ===")
                 print(render_map(engine))
+            stuck_marker = " [STUCK-EXPL]" if any(c >= STUCK_THRESHOLD for c in consecutive_waits.values()) else ""
             print(
                 f"[tick {tick}] F={chosen['F']:<12} M={chosen['M']:<12} "
                 f"stamina(F/M)={engine.stamina['F']:.1f}/{engine.stamina['M']:.1f} "
                 f"batt(F/M)={engine.battery['F']:.1f}/{engine.battery['M']:.1f} "
                 f"stones={engine.stones_collected} hidden={engine.chests_hidden} "
-                f"score={engine.official_score()}"
+                f"score={engine.official_score()}{stuck_marker}"
             )
 
         if args.tick_delay > 0:
