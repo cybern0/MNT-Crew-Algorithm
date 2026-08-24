@@ -8,6 +8,7 @@ hacking, autopilote machines, look-ahead collisions) au lieu du squelette.
 Charge dynamiquement par AlgoTrain.main() via find_factory() -> make_env().
 """
 from __future__ import annotations
+from collections import deque
 from pathlib import Path
 import numpy as np
 import gymnasium as gym
@@ -24,6 +25,11 @@ _HERO_CH, _FACING_CH, _ABS_ELEV_CH, _REL_ELEV_CH, _NEXT_X_CH, _NEXT_G_CH = 9, 10
 
 _STREAK_LIMIT = 3
 _RESOURCE_LOW_TICKS_LIMIT = 10
+# Fenetre glissante pour la detection d'oscillation : si le hero revient sur
+# une position qu'il a occupee dans les _POSITION_HISTORY_LEN derniers deplacements,
+# on declenche la penalite revisited_position. K=6 capture les cycles 2-6,
+# laisse assez de marge pour re-emprunter un chemin legitime apres 6+ pas.
+_POSITION_HISTORY_LEN = 6
 # Le score officiel est injecte a la fin sous forme de difference avec le
 # score initial. Cela evite un bonus constant important, independant des
 # actions, et donne exactement la variation de performance officielle.
@@ -43,17 +49,31 @@ _REWARD_DEFAULTS = {
     "useful_hack": 0.15,
     "useful_fill": 0.75,
     "useful_cut": 0.75,
-    # WAIT contextuel.
+    # WAIT contextuel — assoupli vs la 1re fix trop agressive.
+    # RATIONNEL : la 1re fix poussait wait_productive_action_available a -1.50
+    # pour casser le farm WAIT. Mais combinée au shaping symétrique (aller-retour
+    # ~0), cela rendait l'oscillation (-0.05/pas) bien meilleure marche que WAIT
+    # (-1.55/pas) -> l'agent oscillait au lieu d'attendre. La penalite de
+    # revisite (revisited_position ci-dessous) attaque desormais l'oscillation
+    # directement, ce qui permet de ramener WAIT a un niveau modere qui pousse
+    # a l'exploration sans dominer les autres signaux. Ordre partiel cible :
+    #   avancer (+1.05) > WAIT (-0.75) > osciller (-1.50 a -2.05).
     "step_time_cost": -0.05,
     "wait_recovery_per_stamina": 0.10,
     "wait_forced": 0.0,
     "wait_useful_machine": 0.10,
     "wait_unhack": -0.03,
-    "wait_no_productive_action": -0.10,
-    "wait_productive_action_available": -1.50,   # etait -0.75 -> renforce
-    "wait_full_resources": -2.00,                # etait -1.00 -> renforce
-    "repeated_wait_2": -0.75,                    # etait -0.50 -> renforce
-    "repeated_wait_3_plus": -2.00,               # etait -1.25 -> renforce
+    "wait_no_productive_action": -0.05,
+    "wait_productive_action_available": -0.75,   # etait -1.50 -> assoupli
+    "wait_full_resources": -1.00,                # etait -2.00 -> assoupli
+    "repeated_wait_2": -0.50,                    # etait -0.75 -> assoupli
+    "repeated_wait_3_plus": -1.25,               # etait -2.00 -> assoupli
+    # Anti-oscillation directe : penalite lourde des qu'on revient sur une
+    # position occupee dans les _POSITION_HISTORY_LEN derniers deplacements.
+    # Contrairement a un shaping asymetrique (qui cree du farming), celle-ci
+    # est asymetrique par construction (ne s'applique qu'au retour, jamais a
+    # l'aller) et donc compatible avec le telescoping du _potential().
+    "revisited_position": -2.00,
     # Invalidite et gaspillage.
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,
@@ -222,6 +242,10 @@ class AlgoEnv(gym.Env):
         self._ep_len = 0
         self._ep_wait = 0
         self._ep_invalid = 0
+        # Fenetre glissante des dernieres positions occupees par le hero,
+        # pour detecter les oscillations (cycles 2-6) et appliquer la
+        # penalite revisited_position. Voir _POSITION_HISTORY_LEN.
+        self._position_history: deque[tuple[int, int]] = deque(maxlen=_POSITION_HISTORY_LEN)
 
     # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
     def _build_grid(self):
@@ -355,6 +379,12 @@ class AlgoEnv(gym.Env):
         self._ep_len = 0
         self._ep_wait = 0
         self._ep_invalid = 0
+        # Initialise l'historique des positions avec la position de depart.
+        # Le deque evolue au fil des step() : on n'ajoute QUE les positions
+        # differentes de la precedente (WAIT n'enrichit pas l'historique,
+        # sinon le farm WAIT declencherait faussement la penalite).
+        self._position_history.clear()
+        self._position_history.append(tuple(self.engine.pos[self.hero]))
         return self._obs(), self._info()
 
     def step(self, action):
@@ -363,6 +393,10 @@ class AlgoEnv(gym.Env):
         a_name = self.action_names[action_index]
         precise_mask = e.legal_action_mask(self.hero, self.action_names)
         selected_is_legal = bool(precise_mask[action_index])
+        # Position avant step : sert a detecter un deplacement effectif
+        # (different de WAIT/implicit_wait/invalid) pour mettre a jour
+        # l'historique des positions et appliquer la penalite de revisite.
+        before_pos = tuple(e.pos[self.hero])
         before_chests = {
             (int(cx), int(cy))
             for cx, cy in e.chests
@@ -376,6 +410,13 @@ class AlgoEnv(gym.Env):
         ev = e.step({self.hero: a_name, self.other: other_action})
         my = ev[self.hero]
         other_ev = ev[self.other]
+        after_pos = tuple(e.pos[self.hero])
+        moved = (after_pos != before_pos)
+        # Penalite anti-oscillation : declenchee uniquement si le hero s'est
+        # DEPLACE sur une case qu'il a deja occupee dans les K derniers pas.
+        # WAIT/invalid/implicit_wait ne declenchent pas la penalite (sinon
+        # le farm WAIT cumulerait revisite + wait_penalty, double peine).
+        revisited = moved and (after_pos in self._position_history)
         reward = self._reward(
             my=my,
             other_ev=other_ev,
@@ -387,7 +428,13 @@ class AlgoEnv(gym.Env):
             before_battery=before_battery,
             before_stamina=before_stamina,
             productive_action_available=productive_action_available,
+            revisited=revisited,
         )
+        # Mise a jour de l'historique : on ne stocke QUE les positions
+        # effectivement atteintes par un deplacement, pas les WAIT (sinon
+        # on polluerait le detecteur avec des positions identiques).
+        if moved:
+            self._position_history.append(after_pos)
         # potential shaping (telescoping) to encourage genuine progress.
         # Forme canonique F(s,a,s') = gamma*Phi(s') - Phi(s) (Ng, Harada &
         # Russell 1999) : sans le gamma, un aller-retour ne s'annule plus
@@ -452,10 +499,17 @@ class AlgoEnv(gym.Env):
         before_battery: float,
         before_stamina: float,
         productive_action_available: bool,
+        revisited: bool = False,
     ):
         rc = self.reward_config
         e = self.engine
         reward = rc.get("step_time_cost", -0.05)
+        # Penalite anti-oscillation : s'applique AVANT la branche invalid/wait
+        # car elle reflete un deplacement reel vers une position recente.
+        # Sur une action invalide, le moteur ne bouge pas le hero (implicit_wait)
+        # donc revisited est necessairement False -> pas de double peine.
+        if revisited:
+            reward += rc["revisited_position"]
         if not selected_is_legal or not my["valid"]:
             self._invalid_streak += 1
             reward += self._invalid_penalty(requested_action, my["kind"])

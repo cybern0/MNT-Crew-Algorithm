@@ -214,17 +214,24 @@ DEFAULT_REWARD_CONFIG = {
     "useful_hack": 0.15,
     "useful_fill": 0.75,
     "useful_cut": 0.75,
-    # WAIT contextuel (PÉNALITÉS RENFORCÉES — voir diagnostic Cause 1+4).
+    # WAIT contextuel — assoupli vs la 1re fix trop agressive (voir
+    # commentaire dans AlgoEnv._REWARD_DEFAULTS). La penalite de revisite
+    # (revisited_position ci-dessous) attaque desormais l'oscillation
+    # directement, ce qui permet de ramener WAIT a un niveau modere qui pousse
+    # a l'exploration sans dominer les autres signaux. Ordre partiel cible :
+    #   avancer (+1.05) > WAIT (-0.75) > osciller (-1.50 a -2.05).
     "step_time_cost": -0.05,
     "wait_recovery_per_stamina": 0.10,
     "wait_forced": 0.0,
     "wait_useful_machine": 0.10,
     "wait_unhack": -0.03,
-    "wait_no_productive_action": -0.10,
-    "wait_productive_action_available": -1.50,   # etait -0.75 -> renforce
-    "wait_full_resources": -2.00,                # etait -1.00 -> renforce
-    "repeated_wait_2": -0.75,                    # etait -0.50 -> renforce
-    "repeated_wait_3_plus": -2.00,               # etait -1.25 -> renforce
+    "wait_no_productive_action": -0.05,
+    "wait_productive_action_available": -0.75,   # etait -1.50 -> assoupli
+    "wait_full_resources": -1.00,                # etait -2.00 -> assoupli
+    "repeated_wait_2": -0.50,                    # etait -0.75 -> assoupli
+    "repeated_wait_3_plus": -1.25,               # etait -2.00 -> assoupli
+    # Anti-oscillation directe : voir AlgoEnv._POSITION_HISTORY_LEN.
+    "revisited_position": -2.00,
     # Invalidite et gaspillage.
     "invalid_action": -0.25,
     "repeated_invalid_action": -0.50,

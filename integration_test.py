@@ -1,10 +1,12 @@
-"""integration_test.py — Validation de bout en bout des correctifs apportes
-aux fichiers AlgoEnv.py / PlayOnnx.py / AlgoTrain.py (cf. diagnostic).
+"""integration_test.py — Validation de bout en bout de la strategie
+"Visite recente + WAIT modere" (anti-balancier WAIT <-> oscillation).
 
-Lance une partie courte sur une carte de test miniature et verifie :
+Verifie sur une carte de test miniature :
   - l'env reset/step sans erreur
   - has_productive_action retourne True quand le hero peut bouger
-  - aller-retour (UP puis DOWN) a un gain net ~0 (symetrie shaping)
+  - un aller-retour declenche la penalite revisited_position (-2.0)
+  - un aller-retour coute PLUS cher que 2 WAIT consecutifs
+    (c'est le coeur de la strategie anti-see-saw)
 """
 import sys, os, tempfile, random
 sys.path.insert(0, os.path.dirname(__file__))
@@ -35,16 +37,27 @@ with open(elev_path, "w") as f:
     for row in elev:
         f.write(" ".join(map(str, row)) + "\n")
 
+
+def _make_env():
+    """Env avec ressources non pleines pour declencher wait_productive_action_available
+    (-0.75) au lieu de wait_full_resources (-1.00)."""
+    e = AlgoEnv(map_path, elev_path, hero="F",
+                engine_config=DEFAULT_ENGINE_CONFIG,
+                reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    e.reset()
+    e.engine.stamina["F"] = 50.0
+    e.engine.battery["F"] = 50.0
+    e._prev_potential = e._potential()
+    return e
+
+
 # Test 1: reset/step + has_productive_action
-env = AlgoEnv(map_path, elev_path, hero="F",
-              engine_config=DEFAULT_ENGINE_CONFIG,
-              reward_config=DEFAULT_REWARD_CONFIG, seed=42)
-obs, info = env.reset()
+env = _make_env()
 print("[1] reset OK, hero pos=", env.engine.pos["F"])
 print("[1] has_productive_action au reset =", env._has_productive_action())
 assert env._has_productive_action() is True, "F doit avoir une action productive au reset"
 
-# Test 2: 10 steps aleatoires legaux
+# Test 2: 10 steps aleatoires legaux — verifier qu'on ne reste pas coince
 random.seed(0)
 total_reward = 0.0
 term = trunc = False
@@ -60,36 +73,37 @@ for i in range(10):
         break
 print(f"[2] Total reward sur 10 steps: {total_reward:+.3f}")
 
-# Test 3: symetrie aller-retour
-env2 = AlgoEnv(map_path, elev_path, hero="F",
-              engine_config=DEFAULT_ENGINE_CONFIG,
-              reward_config=DEFAULT_REWARD_CONFIG, seed=42)
-obs, info = env2.reset()
-mask = env2.engine.legal_action_mask("F", env2.action_names)
-move_indices = [i for i, v in enumerate(mask)
-                if v and env2.action_names[i] in ("UP", "DOWN", "LEFT", "RIGHT")]
-print(f"[3] Moves legaux au reset: {[env2.action_names[i] for i in move_indices]}")
+# Test 3: aller-retour coute PLUS cher que 2 WAIT (coeur de la strategie)
+env_a = _make_env()
+right_idx = env_a.action_names.index("RIGHT")
+left_idx = env_a.action_names.index("LEFT")
+_, r_right, _, _, _ = env_a.step(right_idx)
+_, r_left, _, _, _ = env_a.step(left_idx)
+osc_cost = r_right + r_left
+print(f"[3] Aller-retour RIGHT->LEFT: r_right={r_right:+.3f} r_left={r_left:+.3f} total={osc_cost:+.3f}")
+# Le retour doit contenir la penalite de revisite (-2.0).
+assert r_left < -2.0, f"Le retour doit declencher la penalite de revisite, r_left={r_left:+.3f}"
 
-if move_indices:
-    a = move_indices[0]
-    name = env2.action_names[a]
-    opp = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}[name]
-    opp_idx = env2.action_names.index(opp) if opp in env2.action_names else None
-    if opp_idx is not None:
-        _, r1, _, _, _ = env2.step(a)
-        mask2 = env2.engine.legal_action_mask("F", env2.action_names)
-        if mask2[opp_idx]:
-            _, r2, _, _, _ = env2.step(opp_idx)
-            print(f"[3] Aller {name}: r1={r1:+.3f}, Retour {opp}: r2={r2:+.3f}, somme={r1+r2:+.3f}")
-            # Le potential telescoping + shaping symetrique => somme ~ step_time_cost*2 = -0.10
-            # On accepte une tolerance large (le potential varie legerement avec la ressource).
-            assert abs(r1 + r2) < 0.7, f"Aller-retour non symetrique: {r1+r2}"
-            print("[3] Symetrie aller-retour: OK")
-        else:
-            print(f"[3] Action opposee {opp} non legale, test ignore")
-    else:
-        print(f"[3] Pas d'oppose pour {name}, test ignore")
-else:
-    print("[3] Aucun move legal au reset, test ignore")
+env_b = _make_env()
+wait_idx = env_b.action_names.index("WAIT")
+_, w1, _, _, _ = env_b.step(wait_idx)
+_, w2, _, _, _ = env_b.step(wait_idx)
+wait_cost = w1 + w2
+print(f"[3] 2x WAIT (ressources non pleines): w1={w1:+.3f} w2={w2:+.3f} total={wait_cost:+.3f}")
 
-print("\nTous les tests d'integration OK")
+# L'oscillation doit etre PLUS CHERE que 2 WAIT.
+print(f"[3] Verdict: osc_cost={osc_cost:+.3f} vs wait_cost={wait_cost:+.3f}")
+assert osc_cost < wait_cost, (
+    f"L'oscillation ({osc_cost:+.3f}) doit etre plus chere que 2 WAIT "
+    f"({wait_cost:+.3f}) — c'est le coeur de la strategie anti-see-saw."
+)
+
+# Test 4: un pas vers un objectif est recompense positivement
+env_c = _make_env()
+right_idx = env_c.action_names.index("RIGHT")
+# F en (0,0), pierre en (3,4). RIGHT rapproche (Manhattan 7 -> 6).
+_, r, _, _, info = env_c.step(right_idx)
+print(f"[4] RIGHT vers objectif: r={r:+.3f}")
+assert r > 0.3, f"Avancer vers un objectif doit etre recompense, r={r:+.3f}"
+
+print("\nTous les tests d'integration OK — la strategie anti-see-saw fonctionne.")
