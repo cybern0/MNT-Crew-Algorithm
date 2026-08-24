@@ -266,6 +266,13 @@ DEFAULT_REWARD_CONFIG = {
     "machine_stone_recovered": 25.0,
     "machine_stone_stolen_by_other": 0.0,
     "objectives_cleared": 50.0,                  # etait 20.0 -> bonus terminal renforce
+    # --- Strategie Elevation-Aware BFS Potential ---
+    # Shaping vers la machine cible quand un objectif (pierre/coffre) est
+    # inatteignable a pied a cause d'un mur d'élévation. Doit etre aligne
+    # avec AlgoEnv._REWARD_DEFAULTS (cf. test_algoenv_algo_train_reward_configs_aligned).
+    "progress_to_machine": 0.40,
+    "regress_from_machine": -0.30,
+    "elevation_barrier_repeated": -1.50,
 }
 
 

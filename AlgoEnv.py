@@ -109,6 +109,18 @@ _REWARD_DEFAULTS = {
     "machine_stone_recovered": 25.0,
     "machine_stone_stolen_by_other": 0.0,
     "objectives_cleared": 50.0,                  # etait 20.0 -> bonus terminal renforce
+    # --- Strategie Elevation-Aware BFS Potential ---
+    # Shaping vers la machine cible quand un objectif (pierre/coffre) est
+    # inatteignable a pied a cause d'un mur d'élévation. Asymetrique
+    # (progression > |regression|) pour créer un gradient net vers la
+    # machine tant que l'objectif reste bloqué ; le proxy s'éteint dès
+    # que la machine est hackée (la BFS sur machine relaxe les contraintes
+    # et l'objectif devient atteignable).
+    "progress_to_machine": 0.40,
+    "regress_from_machine": -0.30,
+    # Pénalité répétée de mur d'élévation : casse l'oscillation A/B quand
+    # l'agent tente de franchir un mur bloqué plusieurs fois de suite.
+    "elevation_barrier_repeated": -1.50,
 }
 
 
@@ -246,6 +258,14 @@ class AlgoEnv(gym.Env):
         # pour detecter les oscillations (cycles 2-6) et appliquer la
         # penalite revisited_position. Voir _POSITION_HISTORY_LEN.
         self._position_history: deque[tuple[int, int]] = deque(maxlen=_POSITION_HISTORY_LEN)
+        # --- Strategie Elevation-Aware BFS ---
+        # BFS contrainte par l'élévation/tuiles, calcule une fois par état
+        # (invalidée au début de chaque step/reset). Réutilisée par
+        # _nearest_stone_dist(), _nearest_chest_dist(), _potential() et le
+        # shaping vers machine. Coût O(H*W) ~300 ops par appel.
+        self._cached_bfs: dict[tuple[int, int], int] | None = None
+        self._prev_machine_dist: int | None = None
+        self._elevation_block_streak: int = 0
 
     # ---- encodage (identique au contrat 15 canaux d'AlgoGamesEnv) ---------
     def _build_grid(self):
@@ -290,11 +310,15 @@ class AlgoEnv(gym.Env):
             return None
         hx, hy = e.pos[self.hero]
         return min(abs(tx - hx) + abs(ty - hy) for tx, ty in targets)
-    def _nearest_stone_dist(self):
-        return self._nearest_distance(self.engine.stones)
-    def _nearest_chest_dist(self):
-        return self._nearest_distance(
-            {(int(cx), int(cy)) for cx, cy in self.engine.chests}
+    def _nearest_stone_dist(self) -> int | None:
+        # Strategie Elevation-Aware : utilise la BFS cachee (contrainte par
+        # elevation/tuiles/hops) au lieu de Manhattan. Sur terrain plat,
+        # BFS == Manhattan ; sur terrain avec murs, la BFS ne ment pas.
+        return self._bfs_nearest(self._get_bfs(), self.engine.stones)
+    def _nearest_chest_dist(self) -> int | None:
+        return self._bfs_nearest(
+            self._get_bfs(),
+            {(int(cx), int(cy)) for cx, cy in self.engine.chests},
         )
     def _nearest_bush_distance(self, x: int, y: int) -> int | None:
         bushes = {
@@ -306,6 +330,134 @@ class AlgoEnv(gym.Env):
         if not bushes:
             return None
         return min(abs(bx - x) + abs(by - y) for bx, by in bushes)
+
+    # ---- Strategie Elevation-Aware BFS Potential ------------------------------
+    # Cf. diagnostic : la distance de Manhattan ment a l'agent en presence
+    # de murs d'élévation. Un coffre "proche" en Manhattan peut etre
+    # physiquement inaccessible a pied (montee bloquee a >= 3, descente a
+    # >= 5). L'agent s'approche, se bloque, recule, reessaie : comme
+    # progress == |regress|, le cycle est neutre -> oscillation.
+    # La BFS contrainte par l'élévation ne ment plus : un objectif
+    # inatteignable a pied a une distance BFS = None, donc le potentiel
+    # ne s'ameliore pas en s'approchant du mur. A la place on shape vers
+    # la machine cible (les machines ont des contraintes relaxees :
+    # abs(diff) < 5). Une fois la machine hackee, la BFS utilise les
+    # contraintes machine, et l'objectif devient soudainement atteignable
+    # -> gradient fort de shaping qui récompense le hack.
+
+    def _machine_positions(self) -> set[tuple[int, int]]:
+        """Positions (x, y) des machines cibles non hackees pour le hero
+        courant (X pour F, G pour M). Sert de cible pour le shaping
+        machine-proxy."""
+        target_type = "X" if self.hero == "F" else "G"
+        return {
+            (m["x"], m["y"])
+            for m in self.engine.machines
+            if m["type"] == target_type and m["hacked_by"] is None
+        }
+
+    def _elevation_bfs(self, hero: str) -> dict[tuple[int, int], int]:
+        """BFS depuis la position du hero, ne traversant que les aretes
+        reellement empruntables (contraintes d'élévation + tuiles + hops).
+
+        - A pied : hero_uphill_block=3, hero_downhill_block=5
+        - Sur machine : abs(diff) < machine_height_block=5
+        - F saute par-dessus 'o' (trous), bloque par 't' (arbres)
+        - M saute par-dessus 't' (arbres), bloque par 'o' (trous)
+
+        Retourne un dict {(x, y): nombre de pas} pour toutes les cases
+        atteignables depuis la position courante du hero. Coût O(H*W)
+        ~300 ops par appel, negligeable face au forward du reseau.
+        """
+        e = self.engine
+        start = tuple(e.pos[hero])
+        on_machine = e.on_engine[hero] is not None
+
+        dist: dict[tuple[int, int], int] = {start: 0}
+        queue: deque[tuple[int, int]] = deque([start])
+
+        while queue:
+            x, y = queue.popleft()
+            d = dist[(x, y)]
+            for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+                nx, ny = x + dx, y + dy
+                if (nx, ny) in dist:
+                    continue
+                if not e.in_bounds(nx, ny):
+                    continue
+                tile = e.terrain[ny][nx]
+                if tile == '#':
+                    continue
+
+                # --- Contrôle d'élévation ---
+                # Note : e.elev(x, y) prend (col, ligne), pas (ligne, col).
+                diff = e.elev(nx, ny) - e.elev(x, y)
+                if on_machine:
+                    if abs(diff) >= e.cfg.get("machine_height_block", 5):
+                        continue
+                else:
+                    if diff >= e.cfg.get("hero_uphill_block", 3):
+                        continue  # montee bloquee
+                    if -diff >= e.cfg.get("hero_downhill_block", 5):
+                        continue  # descente bloquee
+
+                # --- Sauts (hop) pour F et M (a pied seulement) ---
+                if not on_machine:
+                    if hero == 'F' and tile == 't':
+                        continue  # F ne traverse pas les arbres
+                    if hero == 'M' and tile == 'o':
+                        continue  # M ne traverse pas les trous
+                    is_hop = (hero == 'F' and tile == 'o') or \
+                             (hero == 'M' and tile == 't')
+                    if is_hop:
+                        # Case d'atterrissage : 2 cases dans la meme direction
+                        lx, ly = nx + dx, ny + dy
+                        if not e.in_bounds(lx, ly):
+                            continue
+                        lt = e.terrain[ly][lx]
+                        if lt == '#' or lt == tile:
+                            continue  # chaine de 2 trous/arbres interdite
+                        # Verifier l'élévation de la case d'atterrissage
+                        # par rapport a la case de depart (pas la case
+                        # intermediaire, qui est un trou/Arbre).
+                        hop_diff = e.elev(lx, ly) - e.elev(x, y)
+                        if hop_diff >= e.cfg.get("hero_uphill_block", 3):
+                            continue
+                        if -hop_diff >= e.cfg.get("hero_downhill_block", 5):
+                            continue
+                        if (lx, ly) in dist:
+                            continue
+                        dist[(lx, ly)] = d + 1
+                        queue.append((lx, ly))
+                        continue
+
+                dist[(nx, ny)] = d + 1
+                queue.append((nx, ny))
+
+        return dist
+
+    @staticmethod
+    def _bfs_nearest(
+        bfs_result: dict[tuple[int, int], int],
+        targets: set[tuple[int, int]],
+    ) -> int | None:
+        """Retourne la distance BFS minimale vers n'importe quelle cible,
+        ou None si aucune cible n'est atteignable."""
+        best = None
+        for tx, ty in targets:
+            d = bfs_result.get((tx, ty))
+            if d is not None and (best is None or d < best):
+                best = d
+        return best
+
+    def _get_bfs(self) -> dict[tuple[int, int], int]:
+        """BFS cachee pour l'etat courant, calculee paresseusement et
+        invalidee au debut de chaque step()/reset(). Toutes les methodes
+        qui ont besoin de distance contrainte par l'élévation passent
+        par ici."""
+        if self._cached_bfs is None:
+            self._cached_bfs = self._elevation_bfs(self.hero)
+        return self._cached_bfs
 
     def _has_productive_action(self) -> bool:
         """Indique si le hero a une action utile autre que WAIT/HACK_CW/HACK_CCW.
@@ -354,6 +506,11 @@ class AlgoEnv(gym.Env):
     def _refresh_objective_distances(self) -> None:
         self._prev_stone_dist = self._nearest_stone_dist()
         self._prev_chest_dist = self._nearest_chest_dist()
+        # Distance a la machine cible (X pour F, G pour M) : sert au
+        # shaping machine-proxy quand un objectif est inatteignable a pied.
+        self._prev_machine_dist = self._bfs_nearest(
+            self._get_bfs(), self._machine_positions(),
+        )
 
     # ---- gym API ------------------------------------------------------------
     def reset(self, *, seed=None, options=None):
@@ -368,6 +525,11 @@ class AlgoEnv(gym.Env):
             engine_config=self.engine_config,
             seed=int(self._np_rng.integers(0, 2**31 - 1)),
         )
+        # Invalide le cache BFS : le moteur vient d'etre recree, l'etat a
+        # change. La prochaine _get_bfs() recalculera pour le nouvel etat.
+        # Reinitialise aussi le compteur de murs d'élévation bloquants.
+        self._cached_bfs = None
+        self._elevation_block_streak = 0
         self._invalid_streak = 0
         self._idle_streak = 0
         self._refresh_objective_distances()
@@ -407,6 +569,10 @@ class AlgoEnv(gym.Env):
         before_stamina = e.stamina[self.hero]
         productive_action_available = self._has_productive_action()
         other_action = e.scripted_action(self.other)
+        # Invalide le cache BFS avant de muter l'etat du moteur : la
+        # prochaine _get_bfs() (appelee dans _reward()/_potential())
+        # recalculera pour le nouvel etat. Coût negligeable (~300 ops).
+        self._cached_bfs = None
         ev = e.step({self.hero: a_name, self.other: other_action})
         my = ev[self.hero]
         other_ev = ev[self.other]
@@ -611,6 +777,41 @@ class AlgoEnv(gym.Env):
             )
         self._prev_stone_dist = new_stone_dist
         self._prev_chest_dist = new_chest_dist
+
+        # --- Shaping vers la machine cible quand un objectif est bloque ---
+        # par l'élévation : la BFS sert de détecteur d'inatteignabilité.
+        # Quand pierre OU coffre est inatteignable a pied, on ajoute un
+        # gradient vers la machine cible (X pour F, G pour M). Le gradient
+        # est asymmetric (progression > |regression|) pour créer un net
+        # pull vers la machine, qui s'éteint dès que le hack relaxe les
+        # contraintes et que l'objectif devient atteignable.
+        # Exclu sur les kinds non volontaires (wait/invalid/etc.) pour ne
+        # pas bruitter le signal comme pour le shaping stone/chest.
+        if e.on_engine[self.hero] is None and kind not in (
+            "chest_pushed", "chest_hole", "chest_cliff",
+            "wait", "ride_wait", "unhack", "hack_blocked_rotate",
+            "implicit_wait", "invalid",
+        ):
+            bfs = self._get_bfs()
+            stone_reachable = self._bfs_nearest(bfs, e.stones) is not None
+            chest_reachable = self._bfs_nearest(
+                bfs, {(int(cx), int(cy)) for cx, cy in e.chests},
+            ) is not None
+            if not stone_reachable or not chest_reachable:
+                new_machine_dist = self._bfs_nearest(
+                    bfs, self._machine_positions(),
+                )
+                reward += self._distance_reward(
+                    self._prev_machine_dist, new_machine_dist,
+                    rc["progress_to_machine"], rc["regress_from_machine"],
+                )
+                self._prev_machine_dist = new_machine_dist
+            else:
+                # Objectifs atteignables : réinitialise la reference pour
+                # ne pas garder un stale _prev_machine_dist qui créerait un
+                # faux signal au prochain déclenchement du proxy.
+                self._prev_machine_dist = None
+
         after_chests = {
             (int(cx), int(cy))
             for cx, cy in e.chests
@@ -635,6 +836,20 @@ class AlgoEnv(gym.Env):
                     and new_dist > old_dist
                 ):
                     reward += rc["regress_chest_from_bush"]
+
+        # --- Détection de mur d'élévation répété ---
+        # Quand le hero tente de franchir un mur d'élévation (ou autre
+        # obstacle bloquant) plusieurs fois de suite, on ajoute une
+        # pénalité pour casser l'oscillation A/B autour du mur. Le kind
+        # 'implicit_wait' avec reason 'blocked_move' est émis par
+        # GameEngine quand _hero_target() retourne None (hors-bornes,
+        # '#', 't' pour F, 'o' pour M, ou mur d'élévation).
+        if kind == "implicit_wait" and my.get("reason") == "blocked_move":
+            self._elevation_block_streak += 1
+            if self._elevation_block_streak >= 3:
+                reward += rc["elevation_barrier_repeated"]
+        else:
+            self._elevation_block_streak = 0
         return reward
 
     def _hero_resource_score(self) -> float:
@@ -650,12 +865,39 @@ class AlgoEnv(gym.Env):
         surpasse largement la penalite d'action invalide (-0.25). Sans ce
         renforcement, l'agent apprend que WAIT est plus sur que n'importe quel
         mouvement (cf. diagnostic Cause 1).
+
+        Strategie Elevation-Aware : les distances sont des BFS contraintes
+        par l'élévation (pas de menteur type Manhattan qui croit un coffre
+        proche alors qu'il est derriere un mur). Quand un objectif est
+        inatteignable a pied, on le remplace par un proxy = diamètre de la
+        carte + distance BFS a la machine cible : l'agent est alors shape
+        vers la machine (le hack relaxe les contraintes et l'objectif
+        devient soudainement atteignable -> gradient fort qui recompense
+        le hack). Quand meme la machine est inatteignable (cas rare), le
+        proxy = 2 * diamètre -> aucun gradient, l'agent doit explorer.
         """
         e = self.engine
-        stone_d = self._nearest_stone_dist()
-        chest_d = self._nearest_chest_dist()
-        stone_term = 0.0 if stone_d is None else -0.60 * stone_d   # x3
-        chest_term = 0.0 if chest_d is None else -0.75 * chest_d   # x3
+        bfs = self._get_bfs()
+        stone_d = self._bfs_nearest(bfs, e.stones)
+        chest_d = self._bfs_nearest(
+            bfs,
+            {(int(cx), int(cy)) for cx, cy in e.chests},
+        )
+        machine_d = self._bfs_nearest(bfs, self._machine_positions())
+        unreachable_penalty = self.height + self.width  # diamètre de la carte
+
+        # Proxy : si inatteignable a pied, on shape vers la machine cible.
+        if stone_d is None:
+            stone_d = unreachable_penalty + (
+                machine_d if machine_d is not None else unreachable_penalty
+            )
+        if chest_d is None:
+            chest_d = unreachable_penalty + (
+                machine_d if machine_d is not None else unreachable_penalty
+            )
+
+        stone_term = -0.60 * stone_d   # x3 vs reglage original
+        chest_term = -0.75 * chest_d   # x3 vs reglage original
         resource_term = 0.005 * (e.stamina[self.hero] + e.battery[self.hero])
         return stone_term + chest_term + resource_term
 

@@ -370,3 +370,360 @@ def test_forward_step_is_positively_rewarded():
     print(f"  RIGHT vers pierre (dist 3->2): r={r:+.3f} (potential+shaping-step_cost)")
     # Doit etre positif : potential +0.60 + shaping +0.50 - step_time 0.05 = ~+1.05.
     assert r > 0.5, f"Avancer vers la pierre devrait donner > +0.5, obtenu {r:+.3f}"
+
+
+# ----------------------------------------------------------------------------
+# Tests de la strategie "Elevation-Aware BFS Potential"
+# ----------------------------------------------------------------------------
+# Cf. diagnostic : la distance de Manhattan ment a l'agent en presence de murs
+# d'élévation. Un coffre "proche" en Manhattan peut etre physiquement
+# inaccessible a pied. La BFS contrainte par l'élévation corrige ce mensonge
+# et ajoute un proxy "machine" pour garder un gradient quand un objectif est
+# inatteignable a pied.
+
+
+def test_reward_configs_include_elevation_aware_keys():
+    """Les 3 nouvelles cles (progress_to_machine, regress_from_machine,
+    elevation_barrier_repeated) doivent exister dans _REWARD_DEFAULTS
+    (AlgoEnv) ET DEFAULT_REWARD_CONFIG (AlgoTrain), avec valeurs alignees."""
+    from AlgoEnv import _REWARD_DEFAULTS as env_rc
+    from AlgoTrain import DEFAULT_REWARD_CONFIG as train_rc
+    for key in ("progress_to_machine", "regress_from_machine",
+                "elevation_barrier_repeated"):
+        assert key in env_rc, f"{key} manquant dans AlgoEnv._REWARD_DEFAULTS"
+        assert key in train_rc, f"{key} manquant dans AlgoTrain.DEFAULT_REWARD_CONFIG"
+        assert env_rc[key] == train_rc[key], (
+            f"dephasage sur {key}: env={env_rc[key]} train={train_rc[key]}"
+        )
+    # Penalite de mur d'élévation doit etre forte (>= 1.0 en valeur absolue).
+    assert env_rc["elevation_barrier_repeated"] <= -1.0
+
+
+def test_bfs_flat_map_matches_manhattan():
+    """Sur terrain plat, la BFS doit donner les memes distances que Manhattan
+    et couvrir toute la carte."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    rows = [
+        "F...M",
+        ".....",
+        ".....",
+        "..+..",
+        "..@..",
+    ]
+    H, W = 5, 5
+    elev = np.ones((H, W), dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 50\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+
+    bfs = env._elevation_bfs("F")
+    # F en (0,0), pierre en (2,3) -> Manhattan = 5 = BFS sur terrain plat.
+    assert bfs.get((2, 3)) == 5, f"BFS={bfs.get((2, 3))}, attendu 5"
+    # La BFS couvre toute la carte (25 cases atteignables).
+    assert len(bfs) == H * W, f"BFS couvre {len(bfs)} cases, attendu {H * W}"
+
+
+def test_bfs_respects_elevation_wall():
+    """Un mur d'élévation doit bloquer la BFS. Carte 1-ligne avec F, pierre
+    juste derrière le mur, M a droite. F ne peut pas monter (diff 4 >= 3)."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    rows = ["F+M"]   # H=1, W=3. F en (0,0), pierre en (1,0), M en (2,0).
+    H, W = 1, 3
+    # Elévation : [1, 5, 1] -> mur a (1,0) avec diff=4 >= 3 depuis (0,0).
+    elev = np.array([[1, 5, 1]], dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 50\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+
+    bfs = env._elevation_bfs("F")
+    # F seul dans la BFS : (1,0) (pierre) et (2,0) (M) sont bloqués par le mur.
+    assert (0, 0) in bfs and bfs[(0, 0)] == 0
+    assert (1, 0) not in bfs, (
+        f"(1,0) (pierre) devrait etre bloque par le mur (diff 4 >= 3), "
+        f"BFS keys: {sorted(bfs.keys())}"
+    )
+    assert (2, 0) not in bfs, "(2,0) doit aussi etre inatteignable"
+
+
+def test_bfs_on_machine_relaxes_elevation():
+    """Sur machine, les contraintes deviennent |diff| < machine_height_block=5,
+    donc le mur a diff=4 devient franchissable."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    # 1 ligne, 4 colonnes : F en (0,0), X en (1,0), pierre en (2,0), M en (3,0).
+    rows = ["FX+M"]
+    H, W = 1, 4
+    # Elévation : [1, 1, 5, 1] -> mur a (2,0) avec diff=4 >= 3 depuis (1,0).
+    elev = np.array([[1, 1, 5, 1]], dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 50\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+
+    # A pied depuis (0,0) : (1,0) atteignable (diff 0), (2,0) bloque (diff 4 >= 3).
+    bfs_foot = env._elevation_bfs("F")
+    assert (1, 0) in bfs_foot and bfs_foot[(1, 0)] == 1
+    assert (2, 0) not in bfs_foot, (
+        "A pied, la pierre doit etre inatteignable (diff 4 >= 3)"
+    )
+
+    # Simule le hack : F sur X, on_engine=0, machine hacked_by="F".
+    env.engine.pos["F"] = (1, 0)
+    env.engine.on_engine["F"] = 0
+    env.engine.machines[0]["hacked_by"] = "F"
+
+    # Sur machine : contraintes |diff| < 5. (2,0) a diff=4 depuis (1,0), OK.
+    bfs_machine = env._elevation_bfs("F")
+    assert (2, 0) in bfs_machine, (
+        f"Sur machine, la pierre en (2,0) doit etre atteignable (diff 4 < 5). "
+        f"BFS keys: {sorted(bfs_machine.keys())}"
+    )
+    assert bfs_machine[(2, 0)] == 1
+
+
+def test_potential_uses_machine_proxy_when_objective_unreachable():
+    """Quand un objectif est inatteignable a pied (mur d'élévation),
+    _potential() doit utiliser un proxy = diamètre_carte + distance machine
+    au lieu de retourner stone_term = 0 (comportement legacy qui n'envoyait
+    aucun signal directionnel vers la machine)."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    # 1 ligne, 4 colonnes : F en (0,0), X en (1,0), pierre en (2,0), M en (3,0).
+    rows = ["FX+M"]
+    H, W = 1, 4
+    elev = np.array([[1, 1, 5, 1]], dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 50\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+
+    # Pierre inatteignable a pied, machine X atteignable a 1 pas.
+    bfs = env._get_bfs()
+    assert env._bfs_nearest(bfs, env.engine.stones) is None, (
+        "La pierre doit etre inatteignable a pied"
+    )
+    machine_d = env._bfs_nearest(bfs, env._machine_positions())
+    assert machine_d == 1, f"Machine X a 1 pas de F, obtenu: {machine_d}"
+
+    # Proxy pierre = MAP_DIAMETER + 1 = (1+4) + 1 = 6.
+    # stone_term = -0.60 * 6 = -3.6 (sans proxy, serait 0.0).
+    # Le potentiel doit etre suffisamment negatif pour que le proxy soit actif.
+    pot = env._potential()
+    # Seuil : avec proxy actif, pot < -2.5 (stone_term seul = -3.6).
+    assert pot < -2.5, (
+        f"Proxy doit rendre le potentiel bien negatif (stone_term = -3.6), "
+        f"obtenu: {pot:.3f}"
+    )
+
+
+def test_elevation_barrier_repeated_penalty_fires():
+    """3 implicit_wait/blocked_move consecutifs doivent declencher la
+    penalite elevation_barrier_repeated (-1.50). Verifie aussi que le
+    compteur se reinitialise sur une action non-bloquee."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    # Carte simple sans murs (terrain plat) : on appelle _reward() directement
+    # avec des evenements simules pour isoler la logique de streak.
+    rows = ["F..M"]
+    H, W = 1, 4
+    elev = np.ones((H, W), dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 50\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+    env._elevation_block_streak = 0
+
+    blocked_event = {"valid": True, "kind": "implicit_wait",
+                     "reason": "blocked_move"}
+    other_ev = {"valid": True, "kind": "wait"}
+
+    # 1er blocked_move : streak -> 1, pas de penalite.
+    r1 = env._reward(
+        my=blocked_event, other_ev=other_ev,
+        requested_action="RIGHT", selected_is_legal=True,
+        before_chests=set(), before_hidden=0, before_destroyed=0,
+        before_battery=100.0, before_stamina=100.0,
+        productive_action_available=True, revisited=False,
+    )
+    assert env._elevation_block_streak == 1
+    # Pas de penalite (-1.50) sur le 1er : r1 = step_time_cost (-0.05) seul.
+    assert r1 > -1.0, f"1er blocked_move ne doit pas penaliser, r1={r1:.3f}"
+
+    # 2e blocked_move : streak -> 2, pas de penalite.
+    r2 = env._reward(
+        my=blocked_event, other_ev=other_ev,
+        requested_action="RIGHT", selected_is_legal=True,
+        before_chests=set(), before_hidden=0, before_destroyed=0,
+        before_battery=100.0, before_stamina=100.0,
+        productive_action_available=True, revisited=False,
+    )
+    assert env._elevation_block_streak == 2
+    assert r2 > -1.0, f"2e blocked_move ne doit pas penaliser, r2={r2:.3f}"
+
+    # 3e blocked_move : streak -> 3, penalite -1.50 declenchee.
+    r3 = env._reward(
+        my=blocked_event, other_ev=other_ev,
+        requested_action="RIGHT", selected_is_legal=True,
+        before_chests=set(), before_hidden=0, before_destroyed=0,
+        before_battery=100.0, before_stamina=100.0,
+        productive_action_available=True, revisited=False,
+    )
+    assert env._elevation_block_streak == 3
+    assert r3 <= -1.0, (
+        f"3e blocked_move doit declencher -1.50, r3={r3:.3f}"
+    )
+
+    # Une action non-bloquee doit reinitialiser le streak.
+    move_event = {"valid": True, "kind": "move", "cost": 1.0}
+    env._reward(
+        my=move_event, other_ev=other_ev,
+        requested_action="RIGHT", selected_is_legal=True,
+        before_chests=set(), before_hidden=0, before_destroyed=0,
+        before_battery=100.0, before_stamina=100.0,
+        productive_action_available=True, revisited=False,
+    )
+    assert env._elevation_block_streak == 0, "Action non-bloquee doit reset le streak"
+
+
+def test_step_does_not_crash_with_elevation_walls():
+    """Smoke test : un env avec murs d'élévation doit pouvoir tourner
+    20 steps sans erreur, et la BFS doit etre invalidee a chaque step."""
+    import os, tempfile
+    import numpy as np
+    from AlgoEnv import AlgoEnv
+    from AlgoTrain import DEFAULT_ENGINE_CONFIG, DEFAULT_REWARD_CONFIG
+
+    rows = [
+        "F+..M",   # row 0 : F en (0,0), pierre en (1,0), M en (4,0)
+        ".....",   # row 1
+        ".....",   # row 2
+        "X...G",   # row 3 : X en (0,3), G en (4,3)
+        ".....",   # row 4
+    ]
+    H, W = 5, 5
+    # Mur d'élévation a (1,0) : la pierre y est posée mais inaccessible a pied
+    # car F doit monter de 1 a 5 (diff 4 >= 3).
+    elev = np.array([
+        [1, 5, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+    ], dtype=np.int64)
+    tmp = tempfile.mkdtemp()
+    map_path = os.path.join(tmp, "map.txt")
+    elev_path = os.path.join(tmp, "elevation.txt")
+    with open(map_path, "w") as f:
+        f.write(f"{H} {W} 100\n")
+        for r in rows:
+            f.write(r + "\n")
+    with open(elev_path, "w") as f:
+        for row in elev:
+            f.write(" ".join(map(str, row)) + "\n")
+
+    env = AlgoEnv(map_path, elev_path, hero="F",
+                  engine_config=DEFAULT_ENGINE_CONFIG,
+                  reward_config=DEFAULT_REWARD_CONFIG, seed=42)
+    env.reset()
+    # Au reset : la pierre en (1,0) est inatteignable a pied (mur d'élévation).
+    # La BFS doit le refléter.
+    bfs = env._get_bfs()
+    assert (1, 0) not in bfs, (
+        f"Pierre en (1,0) doit etre inatteignable a pied (mur). "
+        f"BFS keys: {sorted(bfs.keys())}"
+    )
+    # Le proxy machine doit etre actif dans _potential (X atteignable a 3 pas
+    # via colonne 0).
+    assert env._potential() < -2.0
+
+    # 20 steps : ne doit pas crasher, la BFS doit etre reinvalidee a chaque step.
+    for i in range(20):
+        mask = env.engine.legal_action_mask("F", env.action_names)
+        legal = [i for i, v in enumerate(mask) if v]
+        if not legal:
+            break
+        a = legal[i % len(legal)]
+        obs, r, term, trunc, info = env.step(a)
+        # La BFS cachee doit etre reinvalidee a chaque step puis recalculee
+        # paresseusement. Apres step, _cached_bfs peut etre None (invalide
+        # avant mutation) ou rempli (si _reward a deja ete appele).
+        # Verifie qu'apres _get_bfs(), le cache est rempli.
+        _ = env._get_bfs()
+        assert env._cached_bfs is not None
+        if term or trunc:
+            break
+
